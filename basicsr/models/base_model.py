@@ -87,37 +87,38 @@ class BaseModel():
     def setup_schedulers(self):
         """Set up schedulers."""
         train_opt = self.opt['train']
-        scheduler_type = train_opt['scheduler'].pop('type')
+        scheduler_opt = deepcopy(train_opt['scheduler'])
+        scheduler_type = scheduler_opt.pop('type')
         if scheduler_type in ['MultiStepLR', 'MultiStepRestartLR']:
             for optimizer in self.optimizers:
                 self.schedulers.append(
                     lr_scheduler.MultiStepRestartLR(optimizer,
-                                                    **train_opt['scheduler']))
+                                                    **scheduler_opt))
         elif scheduler_type == 'CosineAnnealingRestartLR':
             for optimizer in self.optimizers:
                 self.schedulers.append(
                     lr_scheduler.CosineAnnealingRestartLR(
-                        optimizer, **train_opt['scheduler']))
+                        optimizer, **scheduler_opt))
         elif scheduler_type == 'CosineAnnealingWarmupRestarts':
             for optimizer in self.optimizers:
                 self.schedulers.append(
                     lr_scheduler.CosineAnnealingWarmupRestarts(
-                        optimizer, **train_opt['scheduler']))
+                        optimizer, **scheduler_opt))
         elif scheduler_type == 'CosineAnnealingRestartCyclicLR':
             for optimizer in self.optimizers:
                 self.schedulers.append(
                     lr_scheduler.CosineAnnealingRestartCyclicLR(
-                        optimizer, **train_opt['scheduler']))
+                        optimizer, **scheduler_opt))
         elif scheduler_type == 'TrueCosineAnnealingLR':
             print('..', 'cosineannealingLR')
             for optimizer in self.optimizers:
                 self.schedulers.append(
-                    torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **train_opt['scheduler']))
+                    torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_opt))
         elif scheduler_type == 'CosineAnnealingLRWithRestart':
             print('..', 'CosineAnnealingLR_With_Restart')
             for optimizer in self.optimizers:
                 self.schedulers.append(
-                    lr_scheduler.CosineAnnealingLRWithRestart(optimizer, **train_opt['scheduler']))
+                    lr_scheduler.CosineAnnealingLRWithRestart(optimizer, **scheduler_opt))
         elif scheduler_type == 'LinearLR':
             for optimizer in self.optimizers:
                 self.schedulers.append(
@@ -299,7 +300,6 @@ class BaseModel():
                 param_key = 'params'
                 logger.info('Loading: params_ema does not exist, use params.')
             load_net = load_net[param_key]
-        print(' load net keys', load_net.keys)
         # remove unnecessary 'module.'
         for k, v in deepcopy(load_net).items():
             if k.startswith('module.'):

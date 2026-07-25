@@ -1,7 +1,8 @@
 # general settings
 name: CAME_SAIGFormer_lolv1
 model_type: CAMEModel
-use_amp: False
+use_amp: false
+amp_init_scale: 1024.0
 scale: 1
 num_gpu: 1
 manual_seed: 100
@@ -11,38 +12,33 @@ datasets:
   train:
     name: TrainSet
     type: Dataset_PairedImage
-    dataroot_gt: /home/fds-admin/user_files/lihanting/LOLdataset/our485/high
-    dataroot_lq: /home/fds-admin/user_files/lihanting/LOLdataset/our485/low
+    dataroot_gt: /path/to/LOL-v1/our485/high
+    dataroot_lq: /path/to/LOL-v1/our485/low
     geometric_augs: true
-
     filename_tmpl: '{}'
     io_backend:
       type: disk
-
-    # data loader
     use_shuffle: true
     num_worker_per_gpu: 8
     batch_size_per_gpu: 8
-
     mini_batch_sizes: [8]
     iters: [200000]
     gt_size: 128
     gt_sizes: [128]
-
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
   val:
     name: ValSet
     type: Dataset_PairedImage
-    dataroot_gt: /home/fds-admin/user_files/lihanting/LOLdataset/eval15/high
-    dataroot_lq: /home/fds-admin/user_files/lihanting/LOLdataset/eval15/low
+    dataroot_gt: /path/to/LOL-v1/eval15/high
+    dataroot_lq: /path/to/LOL-v1/eval15/low
     io_backend:
       type: disk
     val_batch_size: 4
     val_num_worker: 8
 
-# network structures
+# network structure and architecture ablations
 network_g:
   type: CAME_SAIGFormer
   embed_dim: 32
@@ -50,26 +46,28 @@ network_g:
   eps: !!float 1e-1
   descriptor_dim: 64
   num_interventions: 2
+  use_camt: true
+  use_manifold_illumination: true
+  use_observability: true
+  use_counterfactual: true
 
-# path
 path:
-  root: /home/fds-admin/user_files/lihanting/model_output
+  root: ./outputs
   pretrain_network_g: ~
   strict_load_g: true
   resume_state: ~
 
 # training settings
-# 消融实验用 100K 即可看趋势；最终论文数据用 200K
 train:
   total_iter: 200000
   warmup_iter: 2000
-  use_grad_clip: true
+  grad_clip_norm: 1.0
 
   scheduler:
     type: CosineAnnealingRestartCyclicLR
     periods: [60000, 140000]
     restart_weights: [1, 1]
-    eta_mins: [0.0003, 0.000001]
+    eta_mins: [0.000001, 0.0000001]
 
   mixing_augs:
     mixup: false
@@ -81,24 +79,27 @@ train:
     lr: !!float 2e-4
     betas: [0.9, 0.999]
 
-  # Standard pixel losses
+  # Standard reconstruction losses are configured only here.
   pixel_opt:
     - type: L1Loss
       loss_weight: 1
       reduction: mean
     - type: SSIMLoss
 
-  # CAME-specific losses
+  # CAME-specific auxiliary losses and loss ablations.
   came_loss_opt:
-    rec_weight: 1.0
-    ssim_weight: 1.0
-    content_inv_weight: 0.1
-    cycle_weight: 0.05
-    raed_weight: 0.05
+    content_inv_weight: 0.05
+    cycle_weight: 0.02
+    raed_weight: 0.03
     obs_smooth_weight: 0.01
-    warmup_iter: 5000  # Start CAME losses after 5K iterations
+    disentangle_weight: 0.01
+    intervention_diversity_weight: 0.005
+    use_raed: true
+    use_cycle: true
+    use_disentangle: true
+    use_intervention_diversity: true
+    warmup_iter: 5000
 
-# validation settings
 val:
   window_size: 4
   val_freq: !!float 0.5e2
@@ -106,24 +107,21 @@ val:
   rgb2bgr: true
   use_image: false
   max_minibatch: 8
-
   metrics:
     psnr:
       type: calculate_psnr
       crop_border: 0
       test_y_channel: false
 
-# logging settings
 logger:
   print_freq: 50
   save_checkpoint_freq: !!float 1e3
   use_tb_logger: true
-  logger_path: /home/fds-admin/user_files/lihanting/model_output
+  logger_path: ./tb_logger
   wandb:
     project: low_light
     resume_id: ~
 
-# dist training settings
 dist_params:
   backend: nccl
   port: 29500

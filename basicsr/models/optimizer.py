@@ -1,5 +1,4 @@
 import torch
-import torch.optim.adamw
 
 
 class SAM(torch.optim.Optimizer):
@@ -27,6 +26,9 @@ class SAM(torch.optim.Optimizer):
         self.base_optimizer = base_optimizer
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
+        for group in self.param_groups:
+            group.setdefault("rho", rho)
+            group.setdefault("adaptive", adaptive)
 
     @torch.no_grad()
     def first_step(self, zero_grad=False):
@@ -47,9 +49,13 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None: continue
-                p.data = self.state[p]["old_p"]  # get back to "w" from "w + e(w)"
+                old_parameter = self.state[p].pop("old_p")
+                p.data.copy_(old_parameter)  # restore "w"
 
         self.base_optimizer.step()  # do the actual "sharpness-aware" update
+        # The scheduler wraps SAM.step(), while CAMEModel calls the explicit
+        # first/second-step API. Mark this optimizer as stepped for schedulers.
+        self._opt_called = True
 
         if zero_grad: self.zero_grad()
 

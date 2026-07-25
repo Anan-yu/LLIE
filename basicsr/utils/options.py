@@ -38,7 +38,7 @@ def parse(opt_path, is_train=True):
     Returns:
         (dict): Options.
     """
-    with open(opt_path, mode='r') as f:
+    with open(opt_path, mode='r', encoding='utf-8') as f:
         Loader, _ = ordered_yaml()
         opt = yaml.load(f, Loader=Loader)
 
@@ -62,7 +62,7 @@ def parse(opt_path, is_train=True):
         if (val is not None) and ('resume_state' in key
                                   or 'pretrain_network' in key):
             opt['path'][key] = osp.expanduser(val)
-    if opt['path']['root'] is '':
+    if opt['path']['root'] == '':
         opt['path']['root'] = osp.abspath(
             osp.join(__file__, osp.pardir, osp.pardir, osp.pardir))
     if is_train:
