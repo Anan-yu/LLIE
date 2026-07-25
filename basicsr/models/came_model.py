@@ -10,7 +10,6 @@ import importlib
 import torch
 from collections import OrderedDict
 from copy import deepcopy
-from os import path as osp
 import glob
 import os
 
@@ -28,9 +27,10 @@ import basicsr.models.optimizer as optimizer
 
 try:
     from torch.amp import autocast, GradScaler
-    load_amp = True
-except:
-    load_amp = False
+    AMP_DEVICE_AWARE = True
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_DEVICE_AWARE = False
 
 
 class CAMEModel(BaseModel):
@@ -45,13 +45,19 @@ class CAMEModel(BaseModel):
     def __init__(self, opt):
         super(CAMEModel, self).__init__(opt)
         
-        # Mixed precision
-        self.use_amp = opt.get('use_amp', False) and load_amp
-        self.amp_scaler = GradScaler(enabled=self.use_amp)
-        if self.use_amp:
-            print('Using Automatic Mixed Precision')
-        else:
-            print('Not using Automatic Mixed Precision')
+        requested_amp = opt.get('use_amp', False)
+        self.use_amp = requested_amp and self.device.type == 'cuda'
+        amp_init_scale = float(opt.get('amp_init_scale', 1024.0))
+        try:
+            self.amp_scaler = GradScaler(
+                'cuda', init_scale=amp_init_scale, enabled=self.use_amp)
+        except TypeError:
+            self.amp_scaler = GradScaler(
+                init_scale=amp_init_scale, enabled=self.use_amp)
+        logger = get_root_logger()
+        if requested_amp and not self.use_amp:
+            logger.warning('AMP was requested but CUDA is unavailable; using full precision.')
+        logger.info(f'Automatic Mixed Precision enabled: {self.use_amp}')
         
         # Define network
         self.net_g = define_network(deepcopy(opt['network_g']))
@@ -66,6 +72,11 @@ class CAMEModel(BaseModel):
         
         if self.is_train:
             self.init_training_settings()
+
+    def _autocast_context(self):
+        if AMP_DEVICE_AWARE:
+            return autocast(device_type=self.device.type, enabled=self.use_amp)
+        return autocast(enabled=self.use_amp)
     
     def init_training_settings(self):
         self.net_g.train()
@@ -98,30 +109,27 @@ class CAMEModel(BaseModel):
         # CAME-specific losses
         came_loss_opt = train_opt.get('came_loss_opt', {})
         self.came_loss = CAMELoss(
-            rec_weight=came_loss_opt.get('rec_weight', 1.0),
-            ssim_weight=came_loss_opt.get('ssim_weight', 1.0),
-            content_inv_weight=came_loss_opt.get('content_inv_weight', 0.1),
-            cycle_weight=came_loss_opt.get('cycle_weight', 0.05),
-            raed_weight=came_loss_opt.get('raed_weight', 0.05),
+            content_inv_weight=came_loss_opt.get('content_inv_weight', 0.05),
+            cycle_weight=came_loss_opt.get('cycle_weight', 0.02),
+            raed_weight=came_loss_opt.get('raed_weight', 0.03),
             obs_smooth_weight=came_loss_opt.get('obs_smooth_weight', 0.01),
+            disentangle_weight=came_loss_opt.get('disentangle_weight', 0.01),
+            intervention_diversity_weight=came_loss_opt.get(
+                'intervention_diversity_weight', 0.005),
+            use_raed=came_loss_opt.get('use_raed', True),
+            use_cycle=came_loss_opt.get('use_cycle', True),
+            use_disentangle=came_loss_opt.get('use_disentangle', True),
+            use_intervention_diversity=came_loss_opt.get(
+                'use_intervention_diversity', True),
         ).to(self.device)
         
         # Progressive loss scheduling: warmup CAME losses after N iterations
         self.came_loss_warmup_iter = came_loss_opt.get('warmup_iter', 5000)
         
-        # Optimizer and scheduler
+        self.grad_clip_norm = float(train_opt.get('grad_clip_norm', 1.0))
+        self.sam_optim = False
         self.setup_optimizers()
         self.setup_schedulers()
-        
-        # SAM optimizer support
-        optim_type = train_opt['optim_g'].pop('type', None)
-        self.sam_optim = False
-        if optim_type is not None and optim_type == 'SAM':
-            self.optimizer_g = optimizer.SAM(
-                self.optimizer_g.param_groups, self.optimizer_g, **train_opt['optim_g'])
-            self.optimizers.pop(-1)
-            self.optimizers.append(self.optimizer_g)
-            self.sam_optim = True
     
     def setup_optimizers(self):
         train_opt = self.opt['train']
@@ -133,11 +141,25 @@ class CAMEModel(BaseModel):
                 logger = get_root_logger()
                 logger.warning(f'Params {k} will not be optimized.')
         
-        optim_type = train_opt['optim_g'].pop('type')
+        optim_config = deepcopy(train_opt['optim_g'])
+        optim_type = optim_config.pop('type')
         if optim_type == 'Adam':
-            self.optimizer_g = torch.optim.Adam(optim_params, **train_opt['optim_g'])
+            self.optimizer_g = torch.optim.Adam(optim_params, **optim_config)
         elif optim_type == 'AdamW':
-            self.optimizer_g = torch.optim.AdamW(optim_params, **train_opt['optim_g'])
+            self.optimizer_g = torch.optim.AdamW(optim_params, **optim_config)
+        elif optim_type == 'SAM':
+            base_config = deepcopy(optim_config.pop('base_optimizer'))
+            base_type = base_config.pop('type')
+            if base_type == 'Adam':
+                base_optimizer = torch.optim.Adam(optim_params, **base_config)
+            elif base_type == 'AdamW':
+                base_optimizer = torch.optim.AdamW(optim_params, **base_config)
+            else:
+                raise NotImplementedError(
+                    f'SAM base optimizer {base_type} not supported.')
+            self.optimizer_g = optimizer.SAM(
+                optim_params, base_optimizer, **optim_config)
+            self.sam_optim = True
         else:
             raise NotImplementedError(f'Optimizer {optim_type} not supported.')
         self.optimizers.append(self.optimizer_g)
@@ -151,64 +173,72 @@ class CAMEModel(BaseModel):
         self.lq = data['lq'].to(self.device)
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
-    
+
+    def _compute_training_loss(self, current_iter):
+        model_output = self.net_g(self.lq)
+        if not isinstance(model_output, dict):
+            model_output = {'output': model_output}
+        output = model_output['output'].clamp(0, 1)
+        model_output['output'] = output
+
+        pixel_loss = output.new_zeros(())
+        for loss_function in self.cri_pix:
+            pixel_loss = pixel_loss + loss_function(output, self.gt)
+
+        came_losses = self.came_loss(model_output, self.gt, self.lq)
+        if self.came_loss_warmup_iter > 0:
+            auxiliary_scale = min(
+                1.0, max(0.0, current_iter / self.came_loss_warmup_iter))
+        else:
+            auxiliary_scale = 1.0
+        scaled_came_losses = {
+            key: value * auxiliary_scale
+            for key, value in came_losses.items()
+            if key != 'l_came_total'
+        }
+        scaled_came_losses['l_came_total'] = torch.stack(
+            list(scaled_came_losses.values())).sum()
+        total_loss = pixel_loss + scaled_came_losses['l_came_total']
+
+        loss_dict = OrderedDict(l_pix=pixel_loss)
+        loss_dict.update(scaled_came_losses)
+        loss_dict['l_total'] = total_loss
+        for name, value in loss_dict.items():
+            if not torch.isfinite(value).all():
+                raise FloatingPointError(
+                    f'Non-finite training loss detected in {name}.')
+        return output, total_loss, loss_dict
+
+    def _clip_gradients(self):
+        if self.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.net_g.parameters(), self.grad_clip_norm)
+
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
-        
-        with autocast(device_type='cuda', enabled=self.use_amp):
-            # Forward pass - returns dict during training
-            model_output = self.net_g(self.lq)
-            
-            # Handle both dict (training) and tensor (inference fallback)
-            if isinstance(model_output, dict):
-                output = model_output['output']
-            else:
-                output = model_output
-                model_output = {'output': output}
-            
-            output = torch.clamp(output, 0, 1)
-            model_output['output'] = output
-            self.output = output
-            
-            loss_dict = OrderedDict()
-            
-            # Standard pixel losses
-            l_pix = 0.
-            for loss_fn in self.cri_pix:
-                l_pix += loss_fn(output, self.gt)
-            loss_dict['l_pix'] = l_pix
-            
-            # CAME-specific losses (with warmup)
-            if current_iter >= self.came_loss_warmup_iter:
-                came_losses = self.came_loss(model_output, self.gt, self.lq)
-                for k, v in came_losses.items():
-                    if k != 'l_rec':  # Avoid double-counting reconstruction
-                        loss_dict[k] = v
-                l_total = l_pix + came_losses['l_total'] - came_losses['l_rec']
-            else:
-                l_total = l_pix
-        
-        self.amp_scaler.scale(l_total).backward()
-        self.amp_scaler.unscale_(self.optimizer_g)
-        
-        if self.opt['train'].get('use_grad_clip', True):
-            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
-        
+        with self._autocast_context():
+            output, total_loss, loss_dict = self._compute_training_loss(
+                current_iter)
+        self.output = output
+
         if self.sam_optim:
-            def closure(losses, model, lq, gt, amp_scaler):
-                out = model(lq)
-                if isinstance(out, dict):
-                    out = out['output']
-                pred = torch.clamp(out, 0, 1)
-                l = sum(loss(pred, gt) for loss in losses)
-                amp_scaler.scale(l).backward()
-                return l
-            self.amp_scaler.step(self.optimizer_g, closure, self.cri_pix,
-                               self.net_g, self.lq, self.gt, self.amp_scaler)
+            # SAM needs two backward passes. Autocast remains supported, while
+            # gradients stay unscaled so both perturbation steps share a scale.
+            total_loss.backward()
+            self._clip_gradients()
+            self.optimizer_g.first_step(zero_grad=True)
+            with self._autocast_context():
+                _, second_loss, _ = self._compute_training_loss(current_iter)
+            second_loss.backward()
+            self._clip_gradients()
+            self.optimizer_g.second_step(zero_grad=True)
         else:
+            self.amp_scaler.scale(total_loss).backward()
+            self.amp_scaler.unscale_(self.optimizer_g)
+            self._clip_gradients()
             self.amp_scaler.step(self.optimizer_g)
-        self.amp_scaler.update()
-        
+            self.amp_scaler.update()
+
         self.log_dict = self.reduce_loss_dict(loss_dict)
         
         if self.ema_decay > 0:
@@ -242,15 +272,18 @@ class CAMEModel(BaseModel):
             self.output = torch.clamp(pred, 0, 1)
         else:
             raw_model = self.net_g.module if hasattr(self.net_g, 'module') else self.net_g
+            was_training = raw_model.training
             raw_model.eval()
-            with torch.no_grad():
-                pred = raw_model(img)
+            try:
+                with torch.no_grad():
+                    pred = raw_model(img)
+            finally:
+                raw_model.train(was_training)
             if isinstance(pred, dict):
                 pred = pred['output']
             if isinstance(pred, list):
                 pred = pred[-1]
             self.output = torch.clamp(pred, 0, 1)
-            self.net_g.train()
     
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         if os.environ.get('LOCAL_RANK', '0') == '0':
@@ -274,8 +307,7 @@ class CAMEModel(BaseModel):
             test = self.nonpad_test
         
         cnt = 0
-        for idx, val_data in enumerate(dataloader):
-            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+        for val_data in dataloader:
             self.feed_data(val_data)
             test()
             
@@ -295,7 +327,7 @@ class CAMEModel(BaseModel):
                     metric_type = opt_.pop('type')
                     self.metric_results[name] += getattr(
                         metric_module, metric_type)(out_dict['result'], out_dict['gt'], **opt_)
-                    cnt += 1
+                cnt += 1
         
         current_metric = 0.
         if with_metrics:
