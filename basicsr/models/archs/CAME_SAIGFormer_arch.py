@@ -2,49 +2,53 @@
 CAME-SAIGFormer: Camera-Adaptive Manifold and Counterfactual Exposure
 Intervention Network for Robust Low-Light Image Enhancement.
 
-Built upon SAIGFormer backbone with three core innovations:
-1. CAMT - Camera-Adaptive Manifold Transform (replaces fixed RGB processing)
-2. CEI  - Counterfactual Exposure Intervention (training-time disentanglement)
-3. OGDR - Observability-Guided Dynamic Restoration (adaptive local/global routing)
+COMPLETE REPLACEMENT of SAIGFormer's original innovations:
+  - SAI2E → ManifoldAdaptiveIllumination (integral image in adaptive manifold space)
+  - IlluminationGuideAttention → ObservabilityConditionedAttention (recoverability-driven routing)
+  - External augmentation → CounterfactualDisentanglement (embedded feature decomposition)
+
+The U-Net encoder-decoder skeleton is retained as standard infrastructure,
+but ALL novel mechanisms are replaced with the new scientific contributions.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import basicsr.models.archs.transformer_block as transformer
-from basicsr.models.archs.SAI2E import SAI2E
 from basicsr.models.archs.came_modules import (
     CAMT,
-    CounterfactualIntervention,
+    ManifoldAdaptiveIllumination,
     ObservabilityEstimator,
-    DynamicRestorationBlock,
+    ObservabilityConditionedAttention,
+    CounterfactualDisentanglement,
+    CAMETransformerBlock,
+    Downsample,
+    Upsample,
+    OverlapPatchEmbed,
 )
 
 
 class CAME_SAIGFormer(nn.Module):
-    """CAME-SAIGFormer: Camera-Adaptive Manifold Enhanced SAIGFormer.
+    """CAME-SAIGFormer: fully replaced core innovations.
     
-    Architecture overview:
-        Input RGB -> CAMT (adaptive manifold) -> SAI2E (illumination guide)
-                  -> Encoder (SAIGTransformer + OGDR) -> Decoder -> Output
-                  + CEI (counterfactual training) + Cycle consistency
+    Architecture:
+        Input → CAMT (adaptive manifold) → ManifoldAdaptiveIllumination (guide)
+              → ObservabilityEstimator → Encoder (CAMETransformerBlocks)
+              → CounterfactualDisentanglement (bottleneck)
+              → Decoder (CAMETransformerBlocks) → Output + residual
     
     Args:
-        embed_dim: Base embedding dimension (default: 32)
-        k_s: Output convolution kernel size (default: 3)
-        encoder_num_blocks: Number of transformer blocks per encoder level
-        decoder_num_blocks: Number of transformer blocks per decoder level
-        ffn_expansion_factor: FFN hidden dimension multiplier
-        heads: Number of attention heads per level
-        train_patch: Patch size for SAI2E integral image
-        eps: Clamping threshold for SAI2E modulation
-        descriptor_dim: CAMT camera descriptor dimension
-        num_interventions: Number of counterfactual interventions (training only)
-        use_ogdr: Whether to use Observability-Guided Dynamic Restoration
-        use_camt: Whether to use Camera-Adaptive Manifold Transform
-        use_cei: Whether to use Counterfactual Exposure Intervention (training only)
+        embed_dim: Base channel dimension
+        k_s: Output conv kernel size
+        encoder_num_blocks: Blocks per encoder level
+        decoder_num_blocks: Blocks per decoder level
+        ffn_expansion_factor: FFN expansion ratio
+        heads: Attention heads per level
+        train_patch: Patch size for manifold adaptive integral
+        eps: Clamping threshold for modulation
+        descriptor_dim: CAMT descriptor dimension
+        num_interventions: Counterfactual intervention count
     """
     
     def __init__(
@@ -56,321 +60,228 @@ class CAME_SAIGFormer(nn.Module):
         ffn_expansion_factor: float = 2.66,
         heads: List[int] = [1, 2, 4, 8],
         train_patch: int = 128,
-        eps: float = 0,
+        eps: float = 0.1,
         descriptor_dim: int = 64,
         num_interventions: int = 2,
-        use_ogdr: bool = True,
-        use_camt: bool = True,
-        use_cei: bool = True,
     ):
         super().__init__()
-        
-        self.use_ogdr = use_ogdr
-        self.use_camt = use_camt
-        self.use_cei = use_cei
         
         inp_channels = 3
         out_channels = 3
         bias = False
         
-        # =====================================================================
-        # Innovation 1: CAMT - Camera-Adaptive Manifold Transform
-        # =====================================================================
-        if self.use_camt:
-            self.camt = CAMT(descriptor_dim=descriptor_dim, num_bins=8)
+        # =================================================================
+        # Innovation 1: CAMT — Camera-Adaptive Manifold Transform
+        # (replaces fixed RGB input assumption)
+        # =================================================================
+        self.camt = CAMT(descriptor_dim=descriptor_dim, num_bins=8)
         
-        # =====================================================================
-        # Innovation 2: CEI - Counterfactual Exposure Intervention
-        # =====================================================================
-        if self.use_cei:
-            self.cei = CounterfactualIntervention(
-                in_channels=inp_channels, 
-                num_interventions=num_interventions
-            )
+        # =================================================================
+        # Innovation 2: ManifoldAdaptiveIllumination
+        # (replaces SAI2E — integral image now in adaptive manifold space,
+        #  conditioned on camera descriptor)
+        # =================================================================
+        self.manifold_illumination = ManifoldAdaptiveIllumination(
+            in_channels=inp_channels,
+            descriptor_dim=descriptor_dim,
+            train_patch=train_patch,
+            eps=eps,
+        )
         
-        # =====================================================================
-        # Innovation 3: OGDR - Observability-Guided Dynamic Restoration
-        # =====================================================================
-        if self.use_ogdr:
-            self.observability_estimator = ObservabilityEstimator(in_channels=3)
-            # OGDR blocks at decoder level 1 and refinement (full resolution)
-            self.ogdr_decoder = DynamicRestorationBlock(
-                dim=int(embed_dim * 2**1), 
-                num_heads=heads[0],
-                ffn_expansion=ffn_expansion_factor
-            )
-            self.ogdr_refinement = DynamicRestorationBlock(
-                dim=int(embed_dim * 2**1),
-                num_heads=heads[0],
-                ffn_expansion=ffn_expansion_factor
-            )
+        # =================================================================
+        # Innovation 3: ObservabilityEstimator
+        # (drives attention routing — replaces blind illumination concat)
+        # =================================================================
+        self.observability_estimator = ObservabilityEstimator()
         
-        # =====================================================================
-        # SAIGFormer Backbone (preserved from original)
-        # =====================================================================
-        
-        # SAI2E illumination guidance
-        self.svp = SAI2E(in_channels=inp_channels, train_patch=train_patch, eps=eps)
-        
-        # Encoder
-        self.patch_embed = transformer.OverlapPatchEmbed(inp_channels, embed_dim, bias=False)
+        # =================================================================
+        # Encoder (uses CAMETransformerBlock, NOT SAIGTransformer)
+        # =================================================================
+        self.patch_embed = OverlapPatchEmbed(inp_channels, embed_dim, bias=bias)
         
         self.encoder_level1 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=embed_dim, num_heads=heads[0],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(encoder_num_blocks[0])
+            CAMETransformerBlock(embed_dim, heads[0], ffn_expansion_factor, bias)
+            for _ in range(encoder_num_blocks[0])
         ])
         
-        self.svp_down1_2 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
-        self.down1_2 = transformer.Downsample(embed_dim)
+        self.illum_down1_2 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
+        self.obs_down1_2 = nn.Conv2d(1, 1, 4, 2, 1, bias=False)
+        self.down1_2 = Downsample(embed_dim)
         self.encoder_level2 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**1), num_heads=heads[1],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(encoder_num_blocks[1])
+            CAMETransformerBlock(int(embed_dim * 2**1), heads[1], ffn_expansion_factor, bias)
+            for _ in range(encoder_num_blocks[1])
         ])
         
-        self.svp_down2_3 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
-        self.down2_3 = transformer.Downsample(int(embed_dim * 2**1))
+        self.illum_down2_3 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
+        self.obs_down2_3 = nn.Conv2d(1, 1, 4, 2, 1, bias=False)
+        self.down2_3 = Downsample(int(embed_dim * 2**1))
         self.encoder_level3 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**2), num_heads=heads[2],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(encoder_num_blocks[2])
+            CAMETransformerBlock(int(embed_dim * 2**2), heads[2], ffn_expansion_factor, bias)
+            for _ in range(encoder_num_blocks[2])
         ])
         
-        self.svp_down3_4 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
-        self.down3_4 = transformer.Downsample(int(embed_dim * 2**2))
+        self.illum_down3_4 = nn.Conv2d(inp_channels, inp_channels, 4, 2, 1, bias=bias, groups=inp_channels)
+        self.obs_down3_4 = nn.Conv2d(1, 1, 4, 2, 1, bias=False)
+        self.down3_4 = Downsample(int(embed_dim * 2**2))
         self.latent = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**3), num_heads=heads[3],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(encoder_num_blocks[3])
+            CAMETransformerBlock(int(embed_dim * 2**3), heads[3], ffn_expansion_factor, bias)
+            for _ in range(encoder_num_blocks[3])
         ])
         
-        # Decoder
+        # =================================================================
+        # Innovation 4: CounterfactualDisentanglement at bottleneck
+        # (replaces external CEI forward pass — embedded feature decomposition)
+        # =================================================================
+        self.disentangle = CounterfactualDisentanglement(
+            dim=int(embed_dim * 2**3),
+            num_interventions=num_interventions,
+        )
+        
+        # =================================================================
+        # Decoder (uses CAMETransformerBlock)
+        # =================================================================
         self.decoder_latent = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**3), num_heads=heads[3],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(1)
+            CAMETransformerBlock(int(embed_dim * 2**3), heads[3], ffn_expansion_factor, bias)
+            for _ in range(1)
         ])
         
-        self.up4_3 = transformer.Upsample(int(embed_dim * 2**3))
-        self.reduce_chan_level3 = nn.Conv2d(int(embed_dim * 2**3), int(embed_dim * 2**2), kernel_size=1, bias=bias)
+        self.up4_3 = Upsample(int(embed_dim * 2**3))
+        self.reduce_chan_level3 = nn.Conv2d(int(embed_dim * 2**3), int(embed_dim * 2**2), 1, bias=bias)
         self.decoder_level3 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**2), num_heads=heads[2],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(decoder_num_blocks[0])
+            CAMETransformerBlock(int(embed_dim * 2**2), heads[2], ffn_expansion_factor, bias)
+            for _ in range(decoder_num_blocks[0])
         ])
         
-        self.up3_2 = transformer.Upsample(int(embed_dim * 2**2))
-        self.reduce_chan_level2 = nn.Conv2d(int(embed_dim * 2**2), int(embed_dim * 2**1), kernel_size=1, bias=bias)
+        self.up3_2 = Upsample(int(embed_dim * 2**2))
+        self.reduce_chan_level2 = nn.Conv2d(int(embed_dim * 2**2), int(embed_dim * 2**1), 1, bias=bias)
         self.decoder_level2 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**1), num_heads=heads[1],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(decoder_num_blocks[1])
+            CAMETransformerBlock(int(embed_dim * 2**1), heads[1], ffn_expansion_factor, bias)
+            for _ in range(decoder_num_blocks[1])
         ])
         
-        self.up2_1 = transformer.Upsample(int(embed_dim * 2**1))
+        self.up2_1 = Upsample(int(embed_dim * 2**1))
         self.decoder_level1 = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**1), num_heads=heads[0],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(decoder_num_blocks[2])
+            CAMETransformerBlock(int(embed_dim * 2**1), heads[0], ffn_expansion_factor, bias)
+            for _ in range(decoder_num_blocks[2])
         ])
         
         # Refinement
         self.refinement = nn.ModuleList([
-            transformer.SAIGTransformer(
-                dim=int(embed_dim * 2**1), num_heads=heads[0],
-                ffn_expansion_factor=ffn_expansion_factor, bias=bias
-            ) for _ in range(decoder_num_blocks[-1])
+            CAMETransformerBlock(int(embed_dim * 2**1), heads[0], ffn_expansion_factor, bias)
+            for _ in range(decoder_num_blocks[-1])
         ])
         
-        # Output projection
-        self.output = nn.Conv2d(int(embed_dim * 2**1), out_channels, kernel_size=k_s, stride=1, padding=k_s//2, bias=bias)
-        
-    def _encode_decode(self, inp_img: torch.Tensor, svp_img_1: torch.Tensor,
-                       observability: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Core encoder-decoder forward pass.
-        
-        Args:
-            inp_img: Input image (B, 3, H, W)
-            svp_img_1: SAI2E illumination guide at full resolution (B, 3, H, W)
-            observability: Optional observability map (B, 1, H, W)
-        Returns:
-            Enhanced output (B, 3, H, W)
-        """
-        # Encoder Level 1
-        inp_enc_level1 = self.patch_embed(inp_img)
-        for block in self.encoder_level1:
-            inp_enc_level1 = block((inp_enc_level1, svp_img_1))
-        out_enc_level1 = inp_enc_level1
-        
-        # Encoder Level 2
-        inp_enc_level2 = self.down1_2(out_enc_level1)
-        svp_img_2 = self.svp_down1_2(svp_img_1)
-        for block in self.encoder_level2:
-            inp_enc_level2 = block((inp_enc_level2, svp_img_2))
-        out_enc_level2 = inp_enc_level2
-        
-        # Encoder Level 3
-        inp_enc_level3 = self.down2_3(out_enc_level2)
-        svp_img_3 = self.svp_down2_3(svp_img_2)
-        for block in self.encoder_level3:
-            inp_enc_level3 = block((inp_enc_level3, svp_img_3))
-        out_enc_level3 = inp_enc_level3
-        
-        # Encoder Level 4 (Latent)
-        inp_enc_level4 = self.down3_4(out_enc_level3)
-        svp_img_4 = self.svp_down3_4(svp_img_3)
-        for block in self.latent:
-            inp_enc_level4 = block((inp_enc_level4, svp_img_4))
-        latent = inp_enc_level4
-        
-        # Decoder
-        for block in self.decoder_latent:
-            latent = block((latent, svp_img_4))
-        
-        inp_dec_level3 = self.up4_3(latent)
-        inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
-        inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
-        for block in self.decoder_level3:
-            inp_dec_level3 = block((inp_dec_level3, svp_img_3))
-        out_dec_level3 = inp_dec_level3
-        
-        inp_dec_level2 = self.up3_2(out_dec_level3)
-        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
-        inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
-        for block in self.decoder_level2:
-            inp_dec_level2 = block((inp_dec_level2, svp_img_2))
-        out_dec_level2 = inp_dec_level2
-        
-        inp_dec_level1 = self.up2_1(out_dec_level2)
-        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
-        for block in self.decoder_level1:
-            inp_dec_level1 = block((inp_dec_level1, svp_img_1))
-        out_dec_level1 = inp_dec_level1
-        
-        # Refinement with SAIGTransformer
-        for block in self.refinement:
-            out_dec_level1 = block((out_dec_level1, svp_img_1))
-        
-        # OGDR: Observability-guided dynamic restoration at full resolution
-        if self.use_ogdr and observability is not None:
-            out_dec_level1 = self.ogdr_decoder(out_dec_level1, observability)
-            out_dec_level1 = self.ogdr_refinement(out_dec_level1, observability)
-        
-        # Output projection + residual
-        out_dec_level1 = self.output(out_dec_level1) + inp_img
-        
-        return out_dec_level1
+        # Output
+        self.output = nn.Conv2d(int(embed_dim * 2**1), out_channels, k_s, 1, k_s//2, bias=bias)
     
     def forward(self, inp_img: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward pass.
-        
-        During training, returns a dict with:
-            'output': Enhanced image (B, 3, H, W)
-            'cf_outputs': List of counterfactual enhanced images (training only)
-            'camt_info': CAMT transform information (if use_camt)
-            'observability': Observability map (if use_ogdr)
-            
-        During inference, returns only the enhanced image tensor.
-        
-        Args:
-            inp_img: Input low-light image (B, 3, H, W) in [0, 1]
-        Returns:
-            Training: Dict with multiple outputs for loss computation
-            Inference: Enhanced image tensor (B, 3, H, W)
         """
-        result = {}
+        Training: returns dict with output + auxiliary info for losses.
+        Inference: returns enhanced image tensor directly.
+        """
+        # =============================================================
+        # Step 1: CAMT — transform to adaptive manifold
+        # =============================================================
+        camt_out = self.camt(inp_img)
+        manifold = camt_out['manifold']       # (B, 3, H, W)
+        descriptor = camt_out['descriptor']   # (B, D)
+        confidence = camt_out['confidence']   # (B, 1, H, W)
         
-        # =====================================================================
-        # Step 1: CAMT - Adaptive color manifold transform
-        # =====================================================================
-        camt_info = None
-        if self.use_camt:
-            camt_info = self.camt(inp_img)
-            # Use manifold representation as input to backbone
-            backbone_input = camt_info['manifold']
-            confidence = camt_info['confidence']
-        else:
-            backbone_input = inp_img
-            confidence = torch.ones(inp_img.shape[0], 1, inp_img.shape[2], inp_img.shape[3],
-                                   device=inp_img.device)
+        # =============================================================
+        # Step 2: ManifoldAdaptiveIllumination (replaces SAI2E)
+        # Integral image computed in ADAPTIVE manifold space
+        # =============================================================
+        illum_guide_1 = self.manifold_illumination(manifold, descriptor)  # (B, 3, H, W)
         
-        # =====================================================================
-        # Step 2: SAI2E illumination guidance (on manifold or RGB)
-        # =====================================================================
-        svp_img_1 = self.svp(backbone_input)
+        # =============================================================
+        # Step 3: Observability estimation (drives attention routing)
+        # =============================================================
+        observability_1 = self.observability_estimator(inp_img, confidence)  # (B, 1, H, W)
         
-        # =====================================================================
-        # Step 3: OGDR - Compute observability map
-        # =====================================================================
-        observability = None
-        if self.use_ogdr:
-            observability = self.observability_estimator(inp_img, confidence)
+        # =============================================================
+        # Encoder
+        # =============================================================
+        # Level 1
+        enc1 = self.patch_embed(manifold)
+        for block in self.encoder_level1:
+            enc1 = block(enc1, illum_guide_1, observability_1)
+        out_enc1 = enc1
         
-        # =====================================================================
-        # Step 4: Main encoder-decoder restoration
-        # =====================================================================
-        output = self._encode_decode(backbone_input, svp_img_1, observability)
+        # Level 2
+        enc2 = self.down1_2(out_enc1)
+        illum_2 = self.illum_down1_2(illum_guide_1)
+        obs_2 = self.obs_down1_2(observability_1)
+        for block in self.encoder_level2:
+            enc2 = block(enc2, illum_2, obs_2)
+        out_enc2 = enc2
         
-        # If using CAMT, the output is in manifold space; 
-        # residual connection already adds backbone_input, so output is manifold-enhanced
-        # We keep it in the same space as input for loss computation
-        if self.use_camt:
-            # The residual learning ensures output stays close to input space
-            # Clamp to valid range
-            output = output.clamp(0, 1)
+        # Level 3
+        enc3 = self.down2_3(out_enc2)
+        illum_3 = self.illum_down2_3(illum_2)
+        obs_3 = self.obs_down2_3(obs_2)
+        for block in self.encoder_level3:
+            enc3 = block(enc3, illum_3, obs_3)
+        out_enc3 = enc3
         
-        # =====================================================================
-        # Step 5: CEI - Counterfactual intervention (training only)
-        # =====================================================================
-        cf_outputs = []
-        if self.use_cei and self.training:
-            counterfactuals, degradation_info = self.cei(inp_img)
-            
-            for cf_input in counterfactuals:
-                # Process counterfactual through same pipeline
-                if self.use_camt:
-                    cf_camt = self.camt(cf_input)
-                    cf_backbone_input = cf_camt['manifold']
-                    cf_confidence = cf_camt['confidence']
-                else:
-                    cf_backbone_input = cf_input
-                    cf_confidence = confidence
-                
-                cf_svp = self.svp(cf_backbone_input)
-                
-                cf_obs = None
-                if self.use_ogdr:
-                    cf_obs = self.observability_estimator(cf_input, cf_confidence)
-                
-                cf_output = self._encode_decode(cf_backbone_input, cf_svp, cf_obs)
-                cf_outputs.append(cf_output.clamp(0, 1))
-            
-            result['cf_outputs'] = cf_outputs
-            result['degradation_info'] = degradation_info
+        # Level 4 (bottleneck)
+        enc4 = self.down3_4(out_enc3)
+        illum_4 = self.illum_down3_4(illum_3)
+        obs_4 = self.obs_down3_4(obs_3)
+        for block in self.latent:
+            enc4 = block(enc4, illum_4, obs_4)
         
-        # =====================================================================
-        # Step 6: Cycle consistency (training only)
-        # =====================================================================
-        if self.use_camt and self.training:
-            # Reconstruct input from manifold representation
-            cycle_recon = self.camt.inverse(camt_info['manifold'], camt_info['descriptor'])
-            result['cycle_recon'] = cycle_recon
+        # =============================================================
+        # Step 4: CounterfactualDisentanglement at bottleneck
+        # =============================================================
+        disentangle_out = self.disentangle(enc4)
+        latent = disentangle_out['output']
         
+        # =============================================================
+        # Decoder
+        # =============================================================
+        for block in self.decoder_latent:
+            latent = block(latent, illum_4, obs_4)
+        
+        dec3 = self.up4_3(latent)
+        dec3 = torch.cat([dec3, out_enc3], 1)
+        dec3 = self.reduce_chan_level3(dec3)
+        for block in self.decoder_level3:
+            dec3 = block(dec3, illum_3, obs_3)
+        
+        dec2 = self.up3_2(dec3)
+        dec2 = torch.cat([dec2, out_enc2], 1)
+        dec2 = self.reduce_chan_level2(dec2)
+        for block in self.decoder_level2:
+            dec2 = block(dec2, illum_2, obs_2)
+        
+        dec1 = self.up2_1(dec2)
+        dec1 = torch.cat([dec1, out_enc1], 1)
+        for block in self.decoder_level1:
+            dec1 = block(dec1, illum_guide_1, observability_1)
+        
+        # Refinement
+        for block in self.refinement:
+            dec1 = block(dec1, illum_guide_1, observability_1)
+        
+        # Output + residual (residual on original input, not manifold)
+        output = self.output(dec1) + inp_img
+        output = output.clamp(0, 1)
+        
+        # =============================================================
         # Pack results
+        # =============================================================
         if self.training:
-            result['output'] = output
-            result['camt_info'] = camt_info
-            result['observability'] = observability
-            return result
+            # Cycle consistency: reconstruct input from manifold
+            cycle_recon = self.camt.inverse(manifold)
+            
+            return {
+                'output': output,
+                'cycle_recon': cycle_recon,
+                'observability': observability_1,
+                'content_features': disentangle_out['content'],
+                'degradation_features': disentangle_out['degradation'],
+                'cf_features': disentangle_out.get('cf_features', []),
+                'descriptor': descriptor,
+            }
         else:
-            # Inference: return only the enhanced image
             return output

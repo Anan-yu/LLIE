@@ -1,201 +1,143 @@
 """
-CAME-SAIGFormer Loss Functions
-================================
-Novel losses for Camera-Adaptive Manifold and Counterfactual Exposure Intervention:
+CAME-SAIGFormer Loss Functions (v2 - Full Replacement)
+=======================================================
+Losses designed for the new architecture where:
+- CEI is embedded (cf_features are bottleneck features, not full images)
+- Content/degradation decomposition is explicit
+- Observability map is produced by the network
 
-1. ContentInvarianceLoss - Enforces scene content consistency across counterfactual states
-2. CycleConsistencyLoss - Ensures CAMT forward-inverse cycle preserves information
-3. RAEDLoss - Reference-Ambiguity-Aware Exposure Distribution Loss
-4. ObservabilitySmoothLoss - Encourages spatially smooth observability transitions
+Loss components:
+1. L_rec: L1 reconstruction
+2. L_ssim: Structural similarity
+3. L_content_inv: Content invariance across counterfactual interventions
+4. L_cycle: CAMT forward-inverse cycle consistency
+5. L_raed: Reference-Ambiguity-Aware Exposure Distribution
+6. L_obs_smooth: Edge-aware observability smoothness
+7. L_disentangle: Content-degradation orthogonality
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 class ContentInvarianceLoss(nn.Module):
-    """Content Invariance Loss for Counterfactual Exposure Intervention.
+    """Content invariance across counterfactual degradation interventions.
     
-    Enforces that the enhanced outputs from different counterfactual degradation
-    states (same content, different exposure/noise) should converge to the same
-    scene content representation.
+    The content features from the bottleneck should remain consistent
+    when degradation variables are intervened upon.
     
-    This is NOT standard contrastive learning - the positive pairs are defined by
-    physical intervention (same scene content under different exposure), and the
-    loss directly measures output consistency.
+    L = (1/K) * sum_k || content - recombine(content, intervened_deg) ||_1
     
-    L_content_inv = (1/K) * sum_k || E(x) - E(cf_k) ||_1
-    where E(x) is the enhanced output and cf_k are counterfactual variants.
+    This is NOT contrastive learning. Positive pairs are defined by
+    physical intervention on the degradation subspace.
     """
     
     def __init__(self, loss_weight: float = 0.1):
         super().__init__()
         self.loss_weight = loss_weight
         
-    def forward(self, output: torch.Tensor, cf_outputs: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            output: Main enhanced output (B, 3, H, W)
-            cf_outputs: List of K counterfactual enhanced outputs, each (B, 3, H, W)
-        Returns:
-            Scalar loss value
-        """
-        if not cf_outputs:
-            return torch.tensor(0.0, device=output.device)
+    def forward(self, output_features: torch.Tensor, 
+                cf_features: List[torch.Tensor]) -> torch.Tensor:
+        if not cf_features:
+            return torch.tensor(0.0, device=output_features.device)
         
         loss = 0.0
-        for cf_out in cf_outputs:
-            # L1 consistency between main output and counterfactual output
-            loss += F.l1_loss(output, cf_out)
+        for cf in cf_features:
+            loss += F.l1_loss(output_features, cf)
+        return self.loss_weight * loss / len(cf_features)
+
+
+class DisentangleLoss(nn.Module):
+    """Content-degradation orthogonality constraint.
+    
+    Ensures content and degradation representations capture different information
+    by encouraging orthogonality in their spatial feature maps.
+    
+    L = |cos_sim(content_flat, degradation_flat)|
+    """
+    
+    def __init__(self, loss_weight: float = 0.02):
+        super().__init__()
+        self.loss_weight = loss_weight
         
-        loss = loss / len(cf_outputs)
-        return self.loss_weight * loss
+    def forward(self, content: torch.Tensor, degradation: torch.Tensor) -> torch.Tensor:
+        # Flatten spatial dims
+        B = content.shape[0]
+        c_flat = content.reshape(B, -1)
+        d_flat = degradation.reshape(B, -1)
+        
+        # Cosine similarity (want it near 0 = orthogonal)
+        cos_sim = F.cosine_similarity(c_flat, d_flat, dim=-1)
+        return self.loss_weight * cos_sim.abs().mean()
 
 
 class CycleConsistencyLoss(nn.Module):
-    """Cycle Consistency Loss for CAMT.
-    
-    Ensures the Camera-Adaptive Manifold Transform is approximately invertible:
-    L_cycle = || x - CAMT^{-1}(CAMT(x)) ||_1
-    
-    This prevents the transform from losing information and ensures
-    the learned manifold preserves color fidelity.
-    """
+    """CAMT forward-inverse cycle: || x - CAMT^{-1}(CAMT(x)) ||_1"""
     
     def __init__(self, loss_weight: float = 0.05):
         super().__init__()
         self.loss_weight = loss_weight
         
     def forward(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            original: Original input image (B, 3, H, W)
-            reconstructed: Cycle-reconstructed image (B, 3, H, W)
-        Returns:
-            Scalar loss value
-        """
         return self.loss_weight * F.l1_loss(original, reconstructed)
 
 
 class RAEDLoss(nn.Module):
     """Reference-Ambiguity-Aware Exposure Distribution Loss.
     
-    Addresses the problem that a single low-light image may correspond to
-    multiple reasonable exposure results. Instead of forcing output to match
-    a fixed GT mean brightness, RAED constrains the exposure distribution:
-    
-    1. Multi-scale luminance quantile matching
-    2. Local exposure ordering consistency  
-    3. Highlight/shadow ratio constraint
-    
-    Does NOT use GT-Mean preprocessing or modify test images.
+    Constrains exposure distribution rather than forcing exact GT mean match.
+    Components: quantile matching + local ordering consistency.
+    Does NOT use GT-Mean preprocessing.
     """
     
     def __init__(self, loss_weight: float = 0.05, num_quantiles: int = 5):
         super().__init__()
         self.loss_weight = loss_weight
         self.num_quantiles = num_quantiles
-        # Quantile levels to match
-        self.register_buffer('quantile_levels', 
-                           torch.linspace(0.1, 0.9, num_quantiles))
+        self.register_buffer('quantile_levels', torch.linspace(0.1, 0.9, num_quantiles))
         
     def _luminance(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual luminance from RGB."""
-        # ITU-R BT.709 luminance
         return 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
     
-    def _quantile_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Multi-scale quantile matching loss."""
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_lum = self._luminance(pred)
+        target_lum = self._luminance(target)
+        
         B = pred.shape[0]
         loss = 0.0
         
+        # Quantile matching
+        pred_flat = pred_lum.reshape(B, -1)
+        target_flat = target_lum.reshape(B, -1)
+        
         for q in self.quantile_levels:
-            # Compute quantile values per image
-            pred_flat = pred.view(B, -1)
-            target_flat = target.view(B, -1)
-            
             k = max(1, int(q * pred_flat.shape[1]))
-            
             pred_q = torch.topk(pred_flat, k, dim=1, largest=True).values.mean(dim=1)
             target_q = torch.topk(target_flat, k, dim=1, largest=True).values.mean(dim=1)
-            
             loss += F.l1_loss(pred_q, target_q)
         
-        return loss / self.num_quantiles
-    
-    def _exposure_ordering_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Local exposure ordering consistency.
+        loss = loss / self.num_quantiles
         
-        Ensures that relative brightness ordering between local patches
-        is preserved (brighter regions in GT should remain brighter in output).
-        """
-        # Downsample to get local patches
-        pred_lum = self._luminance(pred)
-        target_lum = self._luminance(target)
+        # Local ordering: downsampled patch brightness ordering should match
+        patch_pred = F.adaptive_avg_pool2d(pred_lum, 8)
+        patch_target = F.adaptive_avg_pool2d(target_lum, 8)
+        pf = patch_pred.reshape(B, -1)
+        tf = patch_target.reshape(B, -1)
         
-        # Average pool to get patch-level brightness
-        patch_size = 16
-        if pred_lum.shape[-1] < patch_size:
-            patch_size = max(4, pred_lum.shape[-1] // 4)
-            
-        pred_patches = F.adaptive_avg_pool2d(pred_lum, (pred_lum.shape[-2]//patch_size, 
-                                                         pred_lum.shape[-1]//patch_size))
-        target_patches = F.adaptive_avg_pool2d(target_lum, (target_lum.shape[-2]//patch_size,
-                                                             target_lum.shape[-1]//patch_size))
+        # Pairwise ordering hinge
+        pred_diff = pf.unsqueeze(2) - pf.unsqueeze(1)
+        target_diff = tf.unsqueeze(2) - tf.unsqueeze(1)
+        ordering_loss = F.relu(0.05 - pred_diff * torch.sign(target_diff)).mean()
         
-        # Compute pairwise ordering differences
-        B = pred_patches.shape[0]
-        pred_flat = pred_patches.view(B, -1)
-        target_flat = target_patches.view(B, -1)
-        
-        # Sample pairs for efficiency
-        N = pred_flat.shape[1]
-        if N > 64:
-            idx = torch.randperm(N, device=pred.device)[:64]
-            pred_flat = pred_flat[:, idx]
-            target_flat = target_flat[:, idx]
-            N = 64
-        
-        # Pairwise differences
-        pred_diff = pred_flat.unsqueeze(2) - pred_flat.unsqueeze(1)  # (B, N, N)
-        target_diff = target_flat.unsqueeze(2) - target_flat.unsqueeze(1)
-        
-        # Hinge loss on ordering: sign should match
-        ordering_loss = F.relu(0.1 - pred_diff * torch.sign(target_diff)).mean()
-        
-        return ordering_loss
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pred: Enhanced output (B, 3, H, W) in [0, 1]
-            target: Ground truth (B, 3, H, W) in [0, 1]
-        Returns:
-            Scalar loss value
-        """
-        pred_lum = self._luminance(pred)
-        target_lum = self._luminance(target)
-        
-        # Component 1: Quantile matching
-        l_quantile = self._quantile_loss(pred_lum, target_lum)
-        
-        # Component 2: Exposure ordering
-        l_ordering = self._exposure_ordering_loss(pred, target)
-        
-        loss = l_quantile + 0.5 * l_ordering
-        return self.loss_weight * loss
+        return self.loss_weight * (loss + 0.3 * ordering_loss)
 
 
 class ObservabilitySmoothLoss(nn.Module):
-    """Observability Map Smoothness Loss.
+    """Edge-aware smoothness for observability map.
     
-    Encourages the observability map to have spatially smooth transitions
-    (no hard boundaries between local/global restoration regions) while
-    allowing discontinuities at actual image edges.
-    
-    Edge-aware total variation regularization.
+    Encourages smooth transitions except at actual image edges.
     """
     
     def __init__(self, loss_weight: float = 0.01):
@@ -203,109 +145,98 @@ class ObservabilitySmoothLoss(nn.Module):
         self.loss_weight = loss_weight
         
     def forward(self, observability: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            observability: Observability map (B, 1, H, W)
-            image: Input image for edge-aware weighting (B, 3, H, W)
-        Returns:
-            Scalar loss value
-        """
-        # Compute image gradient magnitude as edge weight
         gray = image.mean(dim=1, keepdim=True)
         grad_h = (gray[:, :, 1:, :] - gray[:, :, :-1, :]).abs()
         grad_w = (gray[:, :, :, 1:] - gray[:, :, :, :-1]).abs()
         
-        # Edge-aware weights (low weight at edges, high weight in flat regions)
         weight_h = torch.exp(-grad_h * 10)
         weight_w = torch.exp(-grad_w * 10)
         
-        # Observability gradients
         obs_h = (observability[:, :, 1:, :] - observability[:, :, :-1, :]).abs()
         obs_w = (observability[:, :, :, 1:] - observability[:, :, :, :-1]).abs()
         
-        # Weighted TV
-        loss = (obs_h * weight_h).mean() + (obs_w * weight_w).mean()
-        
-        return self.loss_weight * loss
+        return self.loss_weight * ((obs_h * weight_h).mean() + (obs_w * weight_w).mean())
 
 
 class CAMELoss(nn.Module):
-    """Combined CAME-SAIGFormer loss.
+    """Combined loss for CAME-SAIGFormer v2.
     
-    Aggregates all loss components with configurable weights.
-    Designed for progressive training: start with reconstruction,
-    then add regularization losses.
-    
-    L_total = L_rec + λ1*L_ssim + λ2*L_content_inv + λ3*L_cycle 
-              + λ4*L_raed + λ5*L_obs_smooth
+    L_total = L_rec + L_ssim + λ1*L_content_inv + λ2*L_cycle 
+              + λ3*L_raed + λ4*L_obs_smooth + λ5*L_disentangle
     """
     
     def __init__(
         self,
-        rec_weight: float = 1.0,
-        ssim_weight: float = 1.0,
         content_inv_weight: float = 0.1,
         cycle_weight: float = 0.05,
         raed_weight: float = 0.05,
         obs_smooth_weight: float = 0.01,
+        disentangle_weight: float = 0.02,
     ):
         super().__init__()
-        self.rec_weight = rec_weight
-        self.ssim_weight = ssim_weight
-        
-        self.content_inv_loss = ContentInvarianceLoss(loss_weight=content_inv_weight)
-        self.cycle_loss = CycleConsistencyLoss(loss_weight=cycle_weight)
-        self.raed_loss = RAEDLoss(loss_weight=raed_weight)
-        self.obs_smooth_loss = ObservabilitySmoothLoss(loss_weight=obs_smooth_weight)
+        self.content_inv_loss = ContentInvarianceLoss(content_inv_weight)
+        self.cycle_loss = CycleConsistencyLoss(cycle_weight)
+        self.raed_loss = RAEDLoss(raed_weight)
+        self.obs_smooth_loss = ObservabilitySmoothLoss(obs_smooth_weight)
+        self.disentangle_loss = DisentangleLoss(disentangle_weight)
         
     def forward(self, model_output: Dict, gt: torch.Tensor, 
                 inp_img: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
-            model_output: Dict from CAME_SAIGFormer forward (training mode)
+            model_output: Dict from CAME_SAIGFormer training forward
             gt: Ground truth (B, 3, H, W)
-            inp_img: Original input image (B, 3, H, W)
+            inp_img: Original input (B, 3, H, W)
         Returns:
-            Dict of individual losses and total loss
+            Dict of losses including 'l_total'
         """
         output = model_output['output']
         losses = {}
         
-        # Reconstruction loss (L1)
-        l_rec = F.l1_loss(output, gt)
-        losses['l_rec'] = l_rec
+        # Reconstruction
+        losses['l_rec'] = F.l1_loss(output, gt)
         
-        # Content invariance loss (counterfactual consistency)
-        cf_outputs = model_output.get('cf_outputs', [])
-        l_content_inv = self.content_inv_loss(output, cf_outputs)
-        losses['l_content_inv'] = l_content_inv
+        # Content invariance (counterfactual consistency at bottleneck)
+        cf_features = model_output.get('cf_features', [])
+        output_features = model_output.get('content_features', None)
+        if output_features is not None and cf_features:
+            # Compare content features with counterfactual recombined features
+            losses['l_content_inv'] = self.content_inv_loss(output_features, cf_features)
+        else:
+            losses['l_content_inv'] = torch.tensor(0.0, device=output.device)
         
-        # Cycle consistency loss
+        # Cycle consistency
         cycle_recon = model_output.get('cycle_recon', None)
         if cycle_recon is not None:
-            l_cycle = self.cycle_loss(inp_img, cycle_recon)
+            losses['l_cycle'] = self.cycle_loss(inp_img, cycle_recon)
         else:
-            l_cycle = torch.tensor(0.0, device=output.device)
-        losses['l_cycle'] = l_cycle
+            losses['l_cycle'] = torch.tensor(0.0, device=output.device)
         
-        # RAED loss
-        l_raed = self.raed_loss(output, gt)
-        losses['l_raed'] = l_raed
+        # RAED
+        losses['l_raed'] = self.raed_loss(output, gt)
         
         # Observability smoothness
         observability = model_output.get('observability', None)
         if observability is not None:
-            l_obs = self.obs_smooth_loss(observability, inp_img)
+            losses['l_obs_smooth'] = self.obs_smooth_loss(observability, inp_img)
         else:
-            l_obs = torch.tensor(0.0, device=output.device)
-        losses['l_obs_smooth'] = l_obs
+            losses['l_obs_smooth'] = torch.tensor(0.0, device=output.device)
         
-        # Total loss
-        total = (self.rec_weight * l_rec + 
-                 losses['l_content_inv'] + 
-                 losses['l_cycle'] + 
-                 losses['l_raed'] + 
-                 losses['l_obs_smooth'])
-        losses['l_total'] = total
+        # Disentanglement orthogonality
+        content = model_output.get('content_features', None)
+        degradation = model_output.get('degradation_features', None)
+        if content is not None and degradation is not None:
+            losses['l_disentangle'] = self.disentangle_loss(content, degradation)
+        else:
+            losses['l_disentangle'] = torch.tensor(0.0, device=output.device)
+        
+        # Total (excluding l_rec which is handled by pixel_opt in training model)
+        losses['l_came_total'] = (
+            losses['l_content_inv'] + 
+            losses['l_cycle'] + 
+            losses['l_raed'] + 
+            losses['l_obs_smooth'] + 
+            losses['l_disentangle']
+        )
         
         return losses
