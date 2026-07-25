@@ -1,0 +1,30 @@
+# Pretrained weights (too large for GitHub)
+Pretrained_Weights/*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Experiment outputs
+experiments/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+Pretrained_Weights.zip
