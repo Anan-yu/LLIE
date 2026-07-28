@@ -8,7 +8,7 @@ PSNR/SSIM values or state-of-the-art claims are made for the extension.
 ## CAME-SAIGFormer
 
 CAME-SAIGFormer preserves the SAIGFormer encoder-decoder structure and studies
-four complementary components:
+five complementary components:
 
 - **Camera-Adaptive Manifold Transform (CAMT):** maps RGB into an invertible
   luminance/chroma representation. A camera/degradation descriptor conditions a
@@ -23,6 +23,11 @@ four complementary components:
   degradation subspace and constrains re-encoded content to remain stable. This
   is a latent degradation intervention, not an explicit simulation of the
   physical camera exposure process.
+- **RGB-Manifold Dual-Domain Reliability Fusion:** embeds RGB and CAMT
+  manifold inputs with a shared stem, then performs a constrained feature blend
+  using RGB observability and CAMT confidence. Reliable RGB regions preserve
+  native detail, while poorly observable regions can draw more strongly on the
+  normalized manifold representation.
 
 The auxiliary objectives include CAMT cycle consistency, content invariance,
 content/degradation disentanglement, intervention-direction diversity,
@@ -39,6 +44,7 @@ use_camt: true
 use_manifold_illumination: true
 use_observability: true
 use_counterfactual: true
+use_dual_domain_fusion: true
 ```
 
 Auxiliary loss switches are under `train.came_loss_opt`:
@@ -53,6 +59,12 @@ use_intervention_diversity: true
 All switches default to `true`. Disable one switch at a time and keep the data
 split, seed, schedule, checkpoint policy, and metric implementation fixed for a
 controlled ablation.
+
+During training, CAME-SAIGFormer keeps raw restoration outputs unclamped so
+out-of-range predictions retain gradients; validation and inference clamp to
+the valid image range. CAME auxiliary losses support a cosine decay window via
+`decay_start_iter`, `decay_end_iter`, and `min_auxiliary_scale`, allowing the
+late stage to focus on paired reconstruction.
 
 ## Environment Setup
 
