@@ -381,10 +381,10 @@ def test_ocsf_scratch_config_has_full_training_schedule():
     assert options["train"]["came_loss_opt"]["decay_start_iter"] == 80000
     assert options["train"]["came_loss_opt"]["decay_end_iter"] == 120000
     assert options["datasets"]["train"]["dataroot_lq"].endswith(
-        "datasets/LOLv1/Train/low"
+        "datasets/LOLv1/Train/input"
     )
     assert options["datasets"]["val"]["dataroot_lq"].endswith(
-        "datasets/LOLv1/Test/low"
+        "datasets/LOLv1/Test/input"
     )
 
 
