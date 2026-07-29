@@ -142,25 +142,34 @@ def main():
     torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True
 
-    # automatic resume ..
-    state_folder_path = 'experiments/{}/training_states/'.format(opt['name'])
+    # Automatic resume must follow the configured experiment root.  Using a
+    # hard-coded ``experiments/`` directory misses runs whose root is
+    # ``outputs/experiments/``.
+    state_folder_path = opt['path']['training_states']
     import os
     try:
-        states = os.listdir(state_folder_path)
-    except:
+        states = [
+            state for state in os.listdir(state_folder_path)
+            if state.endswith('.state') and state[:-6].isdigit()
+        ]
+    except OSError:
         states = []
 
     resume_state = None
     if len(states) > 0:
-        max_state_file = '{}.state'.format(max([int(x[0:-6]) for x in states]))
+        max_state_file = '{}.state'.format(max(int(x[:-6]) for x in states))
         resume_state = os.path.join(state_folder_path, max_state_file)
         opt['path']['resume_state'] = resume_state
 
     if opt['path'].get('resume_state'):
         device_id = torch.cuda.current_device()
+        # Training states are trusted files created by this repository and
+        # contain optimizer/scheduler metadata that is not accepted by the
+        # weights-only unpickler enabled by default in PyTorch 2.6.
         resume_state = torch.load(
             opt['path']['resume_state'],
-            map_location=lambda storage, loc: storage.cuda(device_id))
+            map_location=lambda storage, loc: storage.cuda(device_id),
+            weights_only=False)
     else:
         resume_state = None
 
