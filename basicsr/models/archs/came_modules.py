@@ -5,7 +5,6 @@ conditioning color representation, illumination guidance, and feature routing
 on camera/degradation observations.
 """
 
-import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -431,92 +430,6 @@ class ObservabilityEstimator(nn.Module):
         return self.fusion(
             torch.cat([intensity, gradient, noise_inverse, confidence], dim=1)
         )
-
-
-class DualDomainReliabilityFusion(nn.Module):
-    """Reliability-guided convex fusion of RGB and manifold features.
-
-    The physical prior favors manifold features where the RGB observation is
-    weak but CAMT remains confident. A lightweight residual gate learns
-    channel-specific corrections without discarding that prior. The fusion is
-    constrained to remain between the aligned RGB and manifold features.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        init_manifold_weight: float = 0.5,
-        prior_eps: float = 1e-4,
-    ):
-        super().__init__()
-        if not 0 < init_manifold_weight < 1:
-            raise ValueError("init_manifold_weight must be in (0, 1).")
-        if not 0 < prior_eps < 0.5:
-            raise ValueError("prior_eps must be in (0, 0.5).")
-        self.prior_eps = prior_eps
-        hidden_dim = max(8, dim // 2)
-        self.gate_residual = nn.Sequential(
-            nn.Conv2d(2, hidden_dim, 3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, dim, 1, bias=True),
-        )
-        nn.init.zeros_(self.gate_residual[-1].weight)
-        nn.init.zeros_(self.gate_residual[-1].bias)
-        initial_logit = math.log(
-            init_manifold_weight / (1.0 - init_manifold_weight)
-        )
-        self.manifold_weight_logit = nn.Parameter(
-            torch.tensor(initial_logit, dtype=torch.float32)
-        )
-
-    def forward(
-        self,
-        rgb_features: torch.Tensor,
-        manifold_features: torch.Tensor,
-        observability: torch.Tensor,
-        confidence: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if rgb_features.shape != manifold_features.shape:
-            raise ValueError(
-                "RGB and manifold features must have identical shapes, got "
-                f"{rgb_features.shape} and {manifold_features.shape}."
-            )
-        target_size = rgb_features.shape[-2:]
-        if observability.shape[-2:] != target_size:
-            observability = F.interpolate(
-                observability,
-                size=target_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-        if confidence.shape[-2:] != target_size:
-            confidence = F.interpolate(
-                confidence,
-                size=target_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        observability = observability.clamp(0, 1)
-        confidence = confidence.clamp(0, 1)
-        manifold_prior = ((1.0 - observability) * confidence).clamp(
-            self.prior_eps, 1.0 - self.prior_eps
-        )
-        prior_logit = torch.log(manifold_prior) - torch.log1p(
-            -manifold_prior
-        )
-        learned_residual = self.gate_residual(
-            torch.cat([observability, confidence], dim=1)
-        )
-        reliability_gate = torch.sigmoid(prior_logit + learned_residual)
-        manifold_weight = torch.sigmoid(self.manifold_weight_logit).to(
-            dtype=rgb_features.dtype
-        )
-        blend = manifold_weight * reliability_gate
-        fused = rgb_features + blend * (
-            manifold_features - rgb_features
-        )
-        return fused, reliability_gate
 
 
 class ObservabilityConditionedAttention(nn.Module):

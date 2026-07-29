@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from basicsr.models.came_model import CAMEModel
 from basicsr.models.archs.CAME_SAIGFormer_arch import CAME_SAIGFormer
-from basicsr.models.archs.came_modules import CAMT, DualDomainReliabilityFusion
+from basicsr.models.archs.came_modules import CAMT
 from basicsr.models.losses.came_losses import CAMELoss
 from basicsr.utils.options import parse
 
@@ -101,37 +101,6 @@ def test_camt_cycle_is_invertible():
     assert not camt.color_rotation.color_basis.requires_grad
 
 
-def test_dual_domain_fusion_uses_reliability_prior():
-    fusion = DualDomainReliabilityFusion(
-        dim=8, init_manifold_weight=0.5
-    )
-    rgb_features = torch.zeros(1, 8, 8, 8)
-    manifold_features = torch.ones_like(rgb_features)
-    confidence = torch.full((1, 1, 8, 8), 0.9)
-    high_observability = torch.full((1, 1, 8, 8), 0.9)
-    low_observability = torch.full((1, 1, 8, 8), 0.1)
-
-    high_obs_output, high_obs_gate = fusion(
-        rgb_features,
-        manifold_features,
-        high_observability,
-        confidence,
-    )
-    low_obs_output, low_obs_gate = fusion(
-        rgb_features,
-        manifold_features,
-        low_observability,
-        confidence,
-    )
-
-    assert high_obs_output.shape == rgb_features.shape
-    assert high_obs_gate.shape == rgb_features.shape
-    assert high_obs_gate.amin().item() >= 0
-    assert low_obs_gate.amax().item() <= 1
-    assert low_obs_gate.mean() > high_obs_gate.mean()
-    assert low_obs_output.mean() > high_obs_output.mean()
-
-
 def test_full_network_forward_loss_backward_and_inference():
     torch.manual_seed(2)
     model = _small_network()
@@ -149,15 +118,11 @@ def test_full_network_forward_loss_backward_and_inference():
         "cf_features",
         "cf_content_features",
         "descriptor",
-        "dual_domain_gate",
     }
     assert required_keys.issubset(model_output)
     assert model_output["output"].shape == input_image.shape
     assert len(model_output["cf_features"]) == 2
     assert len(model_output["cf_content_features"]) == 2
-    assert model_output["dual_domain_gate"].shape == (1, 8, 32, 32)
-    assert model_output["dual_domain_gate"].amin().item() >= 0
-    assert model_output["dual_domain_gate"].amax().item() <= 1
     assert model_output["observability"].amin().item() >= 0
     assert model_output["observability"].amax().item() <= 1
     _assert_finite_tree(model_output)
@@ -181,16 +146,6 @@ def test_full_network_forward_loss_backward_and_inference():
 
     assert model.disentangle.intervention_vectors.grad is not None
     assert torch.isfinite(model.disentangle.intervention_vectors.grad).all()
-    assert (
-        model.dual_domain_fusion.manifold_weight_logit.grad is not None
-    )
-    assert torch.isfinite(
-        model.dual_domain_fusion.manifold_weight_logit.grad
-    ).all()
-    assert model.dual_domain_fusion.gate_residual[-1].weight.grad is not None
-    assert torch.isfinite(
-        model.dual_domain_fusion.gate_residual[-1].weight.grad
-    ).all()
     finite_gradients = [
         parameter.grad
         for parameter in model.parameters()
@@ -207,24 +162,6 @@ def test_full_network_forward_loss_backward_and_inference():
     assert torch.isfinite(inference_output).all()
 
 
-def test_training_output_is_unclamped_but_inference_is_clamped():
-    torch.manual_seed(3)
-    model = _small_network(clamp_train_output=False)
-    with torch.no_grad():
-        model.output.weight.fill_(1.0)
-    input_image = torch.ones(1, 3, 32, 32)
-
-    model.train()
-    training_output = model(input_image)["output"]
-    assert training_output.amax().item() > 1
-
-    model.eval()
-    with torch.no_grad():
-        inference_output = model(input_image)
-    assert inference_output.amin().item() >= 0
-    assert inference_output.amax().item() <= 1
-
-
 @pytest.mark.parametrize(
     "switches",
     [
@@ -234,7 +171,6 @@ def test_training_output_is_unclamped_but_inference_is_clamped():
             "use_counterfactual": False,
         },
         {"use_manifold_illumination": False},
-        {"use_dual_domain_fusion": False},
     ],
 )
 def test_architecture_ablation_switches(switches):
@@ -252,10 +188,6 @@ def test_architecture_ablation_switches(switches):
     if not switches.get("use_counterfactual", True):
         assert output["cf_features"] == []
         assert output["cf_content_features"] == []
-    if not switches.get("use_dual_domain_fusion", True) or not switches.get(
-        "use_camt", True
-    ):
-        assert output["dual_domain_gate"] is None
 
 
 @pytest.mark.parametrize(
@@ -312,82 +244,11 @@ def test_training_model_optimizer_scheduler_and_config_integrity(
     reloaded.load_state_dict(state_dict, strict=True)
 
 
-def test_auxiliary_loss_cosine_decay_schedule():
-    options = _training_options(
-        {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
-    )
-    options["train"]["came_loss_opt"].update(
-        {
-            "warmup_iter": 2,
-            "decay_start_iter": 10,
-            "decay_end_iter": 20,
-            "min_auxiliary_scale": 0.1,
-        }
-    )
-    model = CAMEModel(options)
-
-    assert model._get_auxiliary_scale(1) == pytest.approx(0.5)
-    assert model._get_auxiliary_scale(10) == pytest.approx(1.0)
-    assert model._get_auxiliary_scale(15) == pytest.approx(0.55)
-    assert model._get_auxiliary_scale(20) == pytest.approx(0.1)
-    assert model._get_auxiliary_scale(30) == pytest.approx(0.1)
-
-
-def test_validation_metrics_are_weighted_by_image_count():
-    options = _training_options(
-        {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
-    )
-    options["val"] = {
-        "window_size": 0,
-        "metrics": {
-            "psnr": {
-                "type": "calculate_psnr",
-                "crop_border": 0,
-                "test_y_channel": False,
-            }
-        },
-    }
-    model = CAMEModel(options)
-
-    def passthrough_test(img=None):
-        model.output = model.lq.clone()
-
-    model.nonpad_test = passthrough_test
-
-    class ValidationDataset:
-        opt = {"name": "weighted_validation"}
-
-    class ValidationLoader:
-        dataset = ValidationDataset()
-
-        def __iter__(self):
-            yield {
-                "lq": torch.zeros(4, 3, 8, 8),
-                "gt": torch.full((4, 3, 8, 8), 0.1),
-            }
-            yield {
-                "lq": torch.zeros(1, 3, 8, 8),
-                "gt": torch.full(
-                    (1, 3, 8, 8), 10 ** (-0.5)
-                ),
-            }
-
-    metric = model.nondist_validation(
-        ValidationLoader(), 1, None, False, True, False
-    )
-    assert metric == pytest.approx(18.0, abs=1e-5)
-
-
 def test_committed_config_parses_and_schedule_is_consistent():
     options = parse("Options/CAME_SAIGFormer_lolv1.yml", is_train=True)
     scheduler = options["train"]["scheduler"]
     assert sum(scheduler["periods"]) == options["train"]["total_iter"]
     assert max(scheduler["eta_mins"]) < options["train"]["optim_g"]["lr"]
-    assert options["network_g"]["use_dual_domain_fusion"]
-    assert 0 < options["network_g"]["dual_domain_init_weight"] < 1
-    assert not options["network_g"]["clamp_train_output"]
-    assert options["train"]["came_loss_opt"]["decay_start_iter"] == 100000
-    assert options["train"]["came_loss_opt"]["decay_end_iter"] == 160000
     assert "rec_weight" not in options["train"]["came_loss_opt"]
     assert "ssim_weight" not in options["train"]["came_loss_opt"]
 

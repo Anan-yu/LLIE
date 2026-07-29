@@ -16,7 +16,6 @@ from basicsr.models.archs.came_modules import (
     CAMT,
     CAMETransformerBlock,
     CounterfactualDisentanglement,
-    DualDomainReliabilityFusion,
     Downsample,
     ManifoldAdaptiveIllumination,
     ObservabilityEstimator,
@@ -44,9 +43,6 @@ class CAME_SAIGFormer(nn.Module):
         use_manifold_illumination: bool = True,
         use_observability: bool = True,
         use_counterfactual: bool = True,
-        use_dual_domain_fusion: bool = True,
-        dual_domain_init_weight: float = 0.5,
-        clamp_train_output: bool = False,
     ):
         super().__init__()
         if not (
@@ -61,8 +57,6 @@ class CAME_SAIGFormer(nn.Module):
         self.use_manifold_illumination = use_manifold_illumination
         self.use_observability = use_observability
         self.use_counterfactual = use_counterfactual
-        self.use_dual_domain_fusion = use_dual_domain_fusion and use_camt
-        self.clamp_train_output = clamp_train_output
         inp_channels = 3
         out_channels = 3
         bias = False
@@ -90,14 +84,6 @@ class CAME_SAIGFormer(nn.Module):
         )
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, embed_dim, bias=bias)
-        self.dual_domain_fusion = (
-            DualDomainReliabilityFusion(
-                dim=embed_dim,
-                init_manifold_weight=dual_domain_init_weight,
-            )
-            if self.use_dual_domain_fusion
-            else None
-        )
         self.encoder_level1 = nn.ModuleList(
             [
                 CAMETransformerBlock(
@@ -256,21 +242,7 @@ class CAME_SAIGFormer(nn.Module):
                 (inp_img.shape[0], 1, inp_img.shape[2], inp_img.shape[3]), 0.5
             )
 
-        dual_domain_gate: Optional[torch.Tensor] = None
-        if self.dual_domain_fusion is not None:
-            # A shared embedding aligns both domains without duplicating the
-            # stem parameters or privileging one representation by capacity.
-            rgb_features = self.patch_embed(inp_img)
-            manifold_features = self.patch_embed(manifold)
-            encoder_1, dual_domain_gate = self.dual_domain_fusion(
-                rgb_features,
-                manifold_features,
-                observability_1,
-                confidence,
-            )
-        else:
-            # Legacy CAME path retained for a controlled fusion ablation.
-            encoder_1 = self.patch_embed(manifold)
+        encoder_1 = self.patch_embed(manifold)
         for block in self.encoder_level1:
             encoder_1 = block(encoder_1, illumination_1, observability_1)
         output_encoder_1 = encoder_1
@@ -331,9 +303,7 @@ class CAME_SAIGFormer(nn.Module):
         for block in self.refinement:
             decoder_1 = block(decoder_1, illumination_1, observability_1)
 
-        output = self.output(decoder_1) + inp_img
-        if not self.training or self.clamp_train_output:
-            output = output.clamp(0, 1)
+        output = (self.output(decoder_1) + inp_img).clamp(0, 1)
         if not self.training:
             return output
 
@@ -352,5 +322,4 @@ class CAME_SAIGFormer(nn.Module):
             "cf_content_features": disentangle_output["cf_content_features"],
             "intervention_vectors": disentangle_output["intervention_vectors"],
             "descriptor": descriptor,
-            "dual_domain_gate": dual_domain_gate,
         }

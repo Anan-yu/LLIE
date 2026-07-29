@@ -50,11 +50,6 @@ network_g:
   use_manifold_illumination: true
   use_observability: true
   use_counterfactual: true
-  # Reliability-guided RGB/manifold fusion at the shared feature stem.
-  use_dual_domain_fusion: true
-  dual_domain_init_weight: 0.5
-  # Preserve gradients outside [0, 1] during training; inference still clamps.
-  clamp_train_output: false
 
 path:
   root: ./outputs
@@ -104,10 +99,6 @@ train:
     use_disentangle: true
     use_intervention_diversity: true
     warmup_iter: 5000
-    # Decay auxiliary constraints after the observed mid-training PSNR peak.
-    decay_start_iter: 100000
-    decay_end_iter: 160000
-    min_auxiliary_scale: 0.1
 
 val:
   window_size: 4
