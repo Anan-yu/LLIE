@@ -380,6 +380,12 @@ def test_ocsf_scratch_config_has_full_training_schedule():
     assert options["train"]["optim_g"]["lr"] == pytest.approx(2e-4)
     assert options["train"]["came_loss_opt"]["decay_start_iter"] == 80000
     assert options["train"]["came_loss_opt"]["decay_end_iter"] == 120000
+    assert options["datasets"]["train"]["dataroot_lq"].endswith(
+        "datasets/LOLv1/Train/low"
+    )
+    assert options["datasets"]["val"]["dataroot_lq"].endswith(
+        "datasets/LOLv1/Test/low"
+    )
 
 
 def test_checkpoint_and_training_state_roundtrip(tmp_path):
