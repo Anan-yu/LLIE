@@ -112,6 +112,19 @@ Best checkpoints produced with EMA contain both `params` and `params_ema`.
 Use `params_ema` for evaluation because validation and best-model selection use
 the EMA network.
 
+If the reproduced 24.71 checkpoint is unavailable, train OCSF from random
+initialization with the dedicated 160K schedule:
+
+```bash
+python basicsr/train.py \
+  --opt Options/CAME_SAIGFormer_lolv1_ocsf_scratch.yml
+```
+
+The scratch schedule uses an 80K primary cycle followed by an 80K refinement
+cycle whose restart learning rate is reduced to 25%. It must not be replaced by
+the 30K fine-tuning configuration, whose learning rate is too small for random
+initialization.
+
 The original SAIGFormer configurations remain available, for example:
 
 ```bash

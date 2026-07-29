@@ -365,6 +365,23 @@ def test_ocsf_finetune_config_is_checkpoint_compatible():
     assert options["datasets"]["val"]["val_batch_size"] == 1
 
 
+def test_ocsf_scratch_config_has_full_training_schedule():
+    options = parse(
+        "Options/CAME_SAIGFormer_lolv1_ocsf_scratch.yml",
+        is_train=True,
+    )
+    scheduler = options["train"]["scheduler"]
+    assert options["path"]["pretrain_network_g"] is None
+    assert options["path"]["strict_load_g"] is True
+    assert options["network_g"]["use_selective_skip_fusion"]
+    assert options["train"]["total_iter"] == 160000
+    assert sum(scheduler["periods"]) == options["train"]["total_iter"]
+    assert scheduler["restart_weights"] == [1, 0.25]
+    assert options["train"]["optim_g"]["lr"] == pytest.approx(2e-4)
+    assert options["train"]["came_loss_opt"]["decay_start_iter"] == 80000
+    assert options["train"]["came_loss_opt"]["decay_end_iter"] == 120000
+
+
 def test_checkpoint_and_training_state_roundtrip(tmp_path):
     options = _training_options(
         {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
