@@ -299,11 +299,6 @@ def main():
                 log_vars.update(model.get_current_log())
                 msg_logger(log_vars)
 
-            # save models and training states
-            if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
-                logger.info('Saving models and training states.')
-                model.save(epoch, current_iter, best_metric=best_metric)
-
             # validation
             if opt.get('val') is not None and (current_iter %
                                                opt['val']['val_freq'] == 0):
@@ -329,6 +324,12 @@ def main():
                     for k, v in opt['val']['metrics'].items():  # best_psnr
                         tb_logger.add_scalar(
                             f'metrics/best_{k}', best_metric[k], current_iter)
+
+            # Save after validation so the training state contains a best
+            # metric discovered at this same iteration.
+            if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
+                logger.info('Saving models and training states.')
+                model.save(epoch, current_iter, best_metric=best_metric)
 
             data_time = time.time()
             iter_time = time.time()

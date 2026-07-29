@@ -432,6 +432,86 @@ class ObservabilityEstimator(nn.Module):
         )
 
 
+class ObservabilitySelectiveSkipFusion(nn.Module):
+    """Refine encoder skips without changing the pretrained initial function.
+
+    The decoder context, illumination guide, and observability map predict a
+    correction for the encoder feature.  The correction head is zero
+    initialized, so enabling this module on a pretrained model initially
+    produces exactly the original skip feature.  Corrections are concentrated
+    in low-observability regions where direct skips are most likely to carry
+    amplified noise.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        illumination_channels: int = 3,
+        bias: bool = False,
+    ):
+        super().__init__()
+        hidden_dim = max(dim // 2, 8)
+        input_dim = dim * 2 + illumination_channels + 1
+        self.context = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, 1, bias=bias),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                3,
+                padding=1,
+                groups=hidden_dim,
+                bias=bias,
+            ),
+            nn.GELU(),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(hidden_dim, 1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.correction = nn.Conv2d(hidden_dim, dim, 1, bias=True)
+        nn.init.zeros_(self.correction.weight)
+        nn.init.zeros_(self.correction.bias)
+
+    def forward(
+        self,
+        skip: torch.Tensor,
+        decoder: torch.Tensor,
+        illumination: torch.Tensor,
+        observability: torch.Tensor,
+    ) -> torch.Tensor:
+        if skip.shape != decoder.shape:
+            raise ValueError(
+                "Skip and decoder features must have identical shapes, got "
+                f"{tuple(skip.shape)} and {tuple(decoder.shape)}."
+            )
+        spatial_size = skip.shape[-2:]
+        if illumination.shape[-2:] != spatial_size:
+            illumination = F.interpolate(
+                illumination,
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        if observability.shape[-2:] != spatial_size:
+            observability = F.interpolate(
+                observability,
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        observability = observability.clamp(0, 1)
+        context = self.context(
+            torch.cat(
+                [skip, decoder, illumination, observability],
+                dim=1,
+            )
+        )
+        uncertainty = 1.0 - observability
+        correction = uncertainty * self.gate(context) * self.correction(context)
+        return skip + correction
+
+
 class ObservabilityConditionedAttention(nn.Module):
     """Channel-transposed attention with spatial illumination modulation."""
 

@@ -19,6 +19,7 @@ from basicsr.models.archs.came_modules import (
     Downsample,
     ManifoldAdaptiveIllumination,
     ObservabilityEstimator,
+    ObservabilitySelectiveSkipFusion,
     OverlapPatchEmbed,
     Upsample,
 )
@@ -43,6 +44,7 @@ class CAME_SAIGFormer(nn.Module):
         use_manifold_illumination: bool = True,
         use_observability: bool = True,
         use_counterfactual: bool = True,
+        use_selective_skip_fusion: bool = False,
     ):
         super().__init__()
         if not (
@@ -57,6 +59,7 @@ class CAME_SAIGFormer(nn.Module):
         self.use_manifold_illumination = use_manifold_illumination
         self.use_observability = use_observability
         self.use_counterfactual = use_counterfactual
+        self.use_selective_skip_fusion = use_selective_skip_fusion
         inp_channels = 3
         out_channels = 3
         bias = False
@@ -165,6 +168,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up4_3 = Upsample(embed_dim * 8)
+        self.skip_fusion_level3 = (
+            ObservabilitySelectiveSkipFusion(embed_dim * 4, bias=bias)
+            if use_selective_skip_fusion
+            else None
+        )
         self.reduce_chan_level3 = nn.Conv2d(
             embed_dim * 8, embed_dim * 4, 1, bias=bias
         )
@@ -177,6 +185,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up3_2 = Upsample(embed_dim * 4)
+        self.skip_fusion_level2 = (
+            ObservabilitySelectiveSkipFusion(embed_dim * 2, bias=bias)
+            if use_selective_skip_fusion
+            else None
+        )
         self.reduce_chan_level2 = nn.Conv2d(
             embed_dim * 4, embed_dim * 2, 1, bias=bias
         )
@@ -189,6 +202,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up2_1 = Upsample(embed_dim * 2)
+        self.skip_fusion_level1 = (
+            ObservabilitySelectiveSkipFusion(embed_dim, bias=bias)
+            if use_selective_skip_fusion
+            else None
+        )
         self.decoder_level1 = nn.ModuleList(
             [
                 CAMETransformerBlock(
@@ -283,6 +301,13 @@ class CAME_SAIGFormer(nn.Module):
         for block in self.decoder_latent:
             latent = block(latent, illumination_4, observability_4)
         decoder_3 = self.up4_3(latent)
+        if self.skip_fusion_level3 is not None:
+            output_encoder_3 = self.skip_fusion_level3(
+                output_encoder_3,
+                decoder_3,
+                illumination_3,
+                observability_3,
+            )
         decoder_3 = self.reduce_chan_level3(
             torch.cat([decoder_3, output_encoder_3], dim=1)
         )
@@ -290,6 +315,13 @@ class CAME_SAIGFormer(nn.Module):
             decoder_3 = block(decoder_3, illumination_3, observability_3)
 
         decoder_2 = self.up3_2(decoder_3)
+        if self.skip_fusion_level2 is not None:
+            output_encoder_2 = self.skip_fusion_level2(
+                output_encoder_2,
+                decoder_2,
+                illumination_2,
+                observability_2,
+            )
         decoder_2 = self.reduce_chan_level2(
             torch.cat([decoder_2, output_encoder_2], dim=1)
         )
@@ -297,6 +329,13 @@ class CAME_SAIGFormer(nn.Module):
             decoder_2 = block(decoder_2, illumination_2, observability_2)
 
         decoder_1 = self.up2_1(decoder_2)
+        if self.skip_fusion_level1 is not None:
+            output_encoder_1 = self.skip_fusion_level1(
+                output_encoder_1,
+                decoder_1,
+                illumination_1,
+                observability_1,
+            )
         decoder_1 = torch.cat([decoder_1, output_encoder_1], dim=1)
         for block in self.decoder_level1:
             decoder_1 = block(decoder_1, illumination_1, observability_1)

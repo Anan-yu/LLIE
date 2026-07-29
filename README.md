@@ -39,6 +39,7 @@ use_camt: true
 use_manifold_illumination: true
 use_observability: true
 use_counterfactual: true
+use_selective_skip_fusion: false
 ```
 
 Auxiliary loss switches are under `train.came_loss_opt`:
@@ -89,6 +90,27 @@ python basicsr/train.py --opt Options/CAME_SAIGFormer_lolv1.yml
 The committed 200K-iteration schedule is an experiment configuration, not
 evidence of convergence. Monitor validation metrics and visual failure cases,
 and compare against the baseline using identical settings.
+
+### LOL-v1 OCSF stage-2 fine-tuning
+
+`Options/CAME_SAIGFormer_lolv1_ocsf_finetune.yml` starts from the reproduced
+24.71 checkpoint and enables Observability-Calibrated Selective Skip Fusion
+(OCSF). Each skip correction is zero initialized, so loading the old checkpoint
+with `strict_load_g: false` initially preserves the pretrained network output.
+The 30K schedule uses a single low-learning-rate cosine cycle, EMA validation,
+a reconstruction-dominant loss, and cosine decay of CAME auxiliary losses.
+
+Place the reproduced checkpoint at the path configured by
+`pretrain_network_g`, then run:
+
+```bash
+python basicsr/train.py \
+  --opt Options/CAME_SAIGFormer_lolv1_ocsf_finetune.yml
+```
+
+Best checkpoints produced with EMA contain both `params` and `params_ema`.
+Use `params_ema` for evaluation because validation and best-model selection use
+the EMA network.
 
 The original SAIGFormer configurations remain available, for example:
 

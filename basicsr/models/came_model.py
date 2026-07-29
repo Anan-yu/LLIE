@@ -7,6 +7,7 @@ RAED, observability smoothness) alongside standard reconstruction losses.
 """
 
 import importlib
+import math
 import torch
 from collections import OrderedDict
 from copy import deepcopy
@@ -125,6 +126,21 @@ class CAMEModel(BaseModel):
         
         # Progressive loss scheduling: warmup CAME losses after N iterations
         self.came_loss_warmup_iter = came_loss_opt.get('warmup_iter', 5000)
+        self.came_loss_decay_start_iter = int(
+            came_loss_opt.get('decay_start_iter', -1))
+        self.came_loss_decay_end_iter = int(
+            came_loss_opt.get('decay_end_iter', -1))
+        self.came_loss_min_scale = float(
+            came_loss_opt.get('min_auxiliary_scale', 1.0))
+        if not 0 <= self.came_loss_min_scale <= 1:
+            raise ValueError('min_auxiliary_scale must be in [0, 1].')
+        if (
+            self.came_loss_decay_start_iter >= 0
+            and self.came_loss_decay_end_iter
+            <= self.came_loss_decay_start_iter
+        ):
+            raise ValueError(
+                'decay_end_iter must be greater than decay_start_iter.')
         
         self.grad_clip_norm = float(train_opt.get('grad_clip_norm', 1.0))
         self.sam_optim = False
@@ -174,6 +190,39 @@ class CAMEModel(BaseModel):
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
 
+    def _get_auxiliary_scale(self, current_iter):
+        if self.came_loss_warmup_iter > 0:
+            warmup_scale = min(
+                1.0,
+                max(0.0, current_iter / self.came_loss_warmup_iter),
+            )
+        else:
+            warmup_scale = 1.0
+
+        if (
+            self.came_loss_decay_start_iter < 0
+            or current_iter <= self.came_loss_decay_start_iter
+        ):
+            return warmup_scale
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    current_iter - self.came_loss_decay_start_iter
+                )
+                / (
+                    self.came_loss_decay_end_iter
+                    - self.came_loss_decay_start_iter
+                ),
+            ),
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        decay_scale = self.came_loss_min_scale + (
+            1.0 - self.came_loss_min_scale
+        ) * cosine
+        return warmup_scale * decay_scale
+
     def _compute_training_loss(self, current_iter):
         model_output = self.net_g(self.lq)
         if not isinstance(model_output, dict):
@@ -186,11 +235,7 @@ class CAMEModel(BaseModel):
             pixel_loss = pixel_loss + loss_function(output, self.gt)
 
         came_losses = self.came_loss(model_output, self.gt, self.lq)
-        if self.came_loss_warmup_iter > 0:
-            auxiliary_scale = min(
-                1.0, max(0.0, current_iter / self.came_loss_warmup_iter))
-        else:
-            auxiliary_scale = 1.0
+        auxiliary_scale = self._get_auxiliary_scale(current_iter)
         scaled_came_losses = {
             key: value * auxiliary_scale
             for key, value in came_losses.items()
@@ -202,6 +247,7 @@ class CAMEModel(BaseModel):
 
         loss_dict = OrderedDict(l_pix=pixel_loss)
         loss_dict.update(scaled_came_losses)
+        loss_dict['aux_scale'] = output.new_tensor(auxiliary_scale)
         loss_dict['l_total'] = total_loss
         for name, value in loss_dict.items():
             if not torch.isfinite(value).all():
@@ -323,17 +369,21 @@ class CAMEModel(BaseModel):
             
             if with_metrics:
                 opt_metric = deepcopy(self.opt['val']['metrics'])
+                batch_size = out_dict['result'].shape[0]
                 for name, opt_ in opt_metric.items():
                     metric_type = opt_.pop('type')
-                    self.metric_results[name] += getattr(
-                        metric_module, metric_type)(out_dict['result'], out_dict['gt'], **opt_)
-                cnt += 1
+                    batch_metric = getattr(
+                        metric_module, metric_type)(
+                            out_dict['result'], out_dict['gt'], **opt_)
+                    self.metric_results[name] += batch_metric * batch_size
+                cnt += batch_size
         
         current_metric = 0.
         if with_metrics:
             for metric in self.metric_results.keys():
                 self.metric_results[metric] /= cnt
-                current_metric = self.metric_results[metric]
+            current_metric = self.metric_results.get(
+                'psnr', next(iter(self.metric_results.values())))
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
         return current_metric
     
@@ -373,12 +423,15 @@ class CAMEModel(BaseModel):
         if not os.path.exists(save_path):
             for r_file in glob.glob(f'{exp_root}/best_*'):
                 os.remove(r_file)
-            net = self.net_g
-            net = net if isinstance(net, list) else [net]
-            param_key = param_key if isinstance(param_key, list) else [param_key]
+            if self.ema_decay > 0:
+                nets = [self.net_g, self.net_g_ema]
+                param_keys = ['params', 'params_ema']
+            else:
+                nets = [self.net_g]
+                param_keys = [param_key]
             
             save_dict = {}
-            for net_, param_key_ in zip(net, param_key):
+            for net_, param_key_ in zip(nets, param_keys):
                 net_ = self.get_bare_model(net_)
                 state_dict = net_.state_dict()
                 for key, param in state_dict.items():
@@ -387,3 +440,6 @@ class CAMEModel(BaseModel):
                     state_dict[key] = param.cpu()
                 save_dict[param_key_] = state_dict
             torch.save(save_dict, save_path)
+            get_root_logger().info(
+                f'Saved new best PSNR model ({psnr:.4f}) at iter '
+                f'{cur_iter}: {save_path}')

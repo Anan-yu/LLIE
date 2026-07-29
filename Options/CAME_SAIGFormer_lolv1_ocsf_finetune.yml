@@ -1,0 +1,137 @@
+# LOL-v1 stage-2 fine-tuning from the 24.71 CAME-SAIGFormer checkpoint.
+# The filename determines the experiment directory in basicsr/utils/options.py.
+name: CAME_SAIGFormer_lolv1_ocsf_finetune
+model_type: CAMEModel
+use_amp: false
+amp_init_scale: 1024.0
+scale: 1
+num_gpu: 1
+manual_seed: 100
+
+datasets:
+  train:
+    name: TrainSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./datasets/LOL-v1/our485/high
+    dataroot_lq: ./datasets/LOL-v1/our485/low
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+    use_shuffle: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    mini_batch_sizes: [8]
+    iters: [30000]
+    gt_size: 128
+    gt_sizes: [128]
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val:
+    name: ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./datasets/LOL-v1/eval15/high
+    dataroot_lq: ./datasets/LOL-v1/eval15/low
+    io_backend:
+      type: disk
+    # One image per validation batch matches the standard per-image PSNR mean.
+    val_batch_size: 1
+    val_num_worker: 4
+
+network_g:
+  type: CAME_SAIGFormer
+  embed_dim: 32
+  train_patch: 128
+  eps: !!float 1e-1
+  descriptor_dim: 64
+  num_interventions: 2
+  use_camt: true
+  use_manifold_illumination: true
+  use_observability: true
+  use_counterfactual: true
+  use_selective_skip_fusion: true
+
+path:
+  root: ./outputs
+  pretrain_network_g: ./outputs/experiments/CAME_SAIGFormer_lolv1/best_psnr_24.71_113000.pth
+  # The pretrained checkpoint predates the new zero-initialized skip modules.
+  strict_load_g: false
+  param_key: params
+  resume_state: ~
+
+train:
+  total_iter: 30000
+  warmup_iter: 500
+  grad_clip_norm: 1.0
+  ema_decay: 0.999
+
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [30000]
+    restart_weights: [1]
+    eta_mins: [0.0000001]
+
+  mixing_augs:
+    mixup: false
+    mixup_beta: 1.2
+    use_identity: true
+
+  optim_g:
+    type: Adam
+    lr: !!float 1e-5
+    betas: [0.9, 0.999]
+
+  # Reconstruction-dominant objective for RGB-PSNR fine-tuning.
+  pixel_opt:
+    - type: L1Loss
+      loss_weight: 1
+      reduction: mean
+    - type: SSIMLoss
+      loss_weight: 0.1
+    - type: PSNRLoss
+      loss_weight: 0.01
+      reduction: mean
+      toY: false
+
+  came_loss_opt:
+    content_inv_weight: 0.05
+    cycle_weight: 0.02
+    raed_weight: 0.03
+    obs_smooth_weight: 0.01
+    disentangle_weight: 0.01
+    intervention_diversity_weight: 0.005
+    use_raed: true
+    use_cycle: true
+    use_disentangle: true
+    use_intervention_diversity: true
+    warmup_iter: 0
+    decay_start_iter: 0
+    decay_end_iter: 10000
+    min_auxiliary_scale: 0.05
+
+val:
+  window_size: 4
+  val_freq: !!float 5e2
+  save_img: false
+  rgb2bgr: true
+  use_image: false
+  max_minibatch: 1
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: !!float 1e3
+  use_tb_logger: true
+  logger_path: ./tb_logger
+  wandb:
+    project: low_light
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

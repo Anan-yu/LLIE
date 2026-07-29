@@ -162,6 +162,41 @@ def test_full_network_forward_loss_backward_and_inference():
     assert torch.isfinite(inference_output).all()
 
 
+def test_selective_skip_fusion_preserves_pretrained_initial_function():
+    torch.manual_seed(3)
+    baseline = _small_network(use_selective_skip_fusion=False)
+    enhanced = _small_network(use_selective_skip_fusion=True)
+    incompatible = enhanced.load_state_dict(
+        baseline.state_dict(),
+        strict=False,
+    )
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all(
+        key.startswith("skip_fusion_level")
+        for key in incompatible.missing_keys
+    )
+
+    input_image = torch.rand(1, 3, 32, 32)
+    baseline.eval()
+    enhanced.eval()
+    with torch.no_grad():
+        baseline_output = baseline(input_image)
+        enhanced_output = enhanced(input_image)
+    torch.testing.assert_close(enhanced_output, baseline_output)
+
+    enhanced.train()
+    output = enhanced(input_image)["output"]
+    output.mean().backward()
+    correction_gradients = [
+        enhanced.skip_fusion_level1.correction.weight.grad,
+        enhanced.skip_fusion_level2.correction.weight.grad,
+        enhanced.skip_fusion_level3.correction.weight.grad,
+    ]
+    assert all(gradient is not None for gradient in correction_gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in correction_gradients)
+
+
 @pytest.mark.parametrize(
     "switches",
     [
@@ -244,6 +279,70 @@ def test_training_model_optimizer_scheduler_and_config_integrity(
     reloaded.load_state_dict(state_dict, strict=True)
 
 
+def test_auxiliary_loss_cosine_decay_schedule():
+    options = _training_options(
+        {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
+    )
+    options["train"]["came_loss_opt"].update(
+        {
+            "warmup_iter": 2,
+            "decay_start_iter": 10,
+            "decay_end_iter": 20,
+            "min_auxiliary_scale": 0.1,
+        }
+    )
+    model = CAMEModel(options)
+
+    assert model._get_auxiliary_scale(1) == pytest.approx(0.5)
+    assert model._get_auxiliary_scale(10) == pytest.approx(1.0)
+    assert model._get_auxiliary_scale(15) == pytest.approx(0.55)
+    assert model._get_auxiliary_scale(20) == pytest.approx(0.1)
+    assert model._get_auxiliary_scale(30) == pytest.approx(0.1)
+
+
+def test_validation_metrics_are_weighted_by_image_count():
+    options = _training_options(
+        {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
+    )
+    options["val"] = {
+        "window_size": 0,
+        "metrics": {
+            "psnr": {
+                "type": "calculate_psnr",
+                "crop_border": 0,
+                "test_y_channel": False,
+            }
+        },
+    }
+    model = CAMEModel(options)
+
+    def passthrough_test(img=None):
+        model.output = model.lq.clone()
+
+    model.nonpad_test = passthrough_test
+
+    class ValidationDataset:
+        opt = {"name": "weighted_validation"}
+
+    class ValidationLoader:
+        dataset = ValidationDataset()
+
+        def __iter__(self):
+            yield {
+                "lq": torch.zeros(4, 3, 8, 8),
+                "gt": torch.full((4, 3, 8, 8), 0.1),
+            }
+            yield {
+                "lq": torch.zeros(1, 3, 8, 8),
+                "gt": torch.full((1, 3, 8, 8), 10 ** (-0.5)),
+            }
+
+    metric = model.nondist_validation(
+        ValidationLoader(), 1, None, False, True, False
+    )
+    assert metric == pytest.approx(18.0, abs=1e-5)
+
+
 def test_committed_config_parses_and_schedule_is_consistent():
     options = parse("Options/CAME_SAIGFormer_lolv1.yml", is_train=True)
     scheduler = options["train"]["scheduler"]
@@ -251,6 +350,19 @@ def test_committed_config_parses_and_schedule_is_consistent():
     assert max(scheduler["eta_mins"]) < options["train"]["optim_g"]["lr"]
     assert "rec_weight" not in options["train"]["came_loss_opt"]
     assert "ssim_weight" not in options["train"]["came_loss_opt"]
+
+
+def test_ocsf_finetune_config_is_checkpoint_compatible():
+    options = parse(
+        "Options/CAME_SAIGFormer_lolv1_ocsf_finetune.yml",
+        is_train=True,
+    )
+    assert options["network_g"]["use_selective_skip_fusion"]
+    assert options["path"]["strict_load_g"] is False
+    assert options["train"]["ema_decay"] == pytest.approx(0.999)
+    assert sum(options["train"]["scheduler"]["periods"]) == 30000
+    assert options["train"]["came_loss_opt"]["decay_end_iter"] == 10000
+    assert options["datasets"]["val"]["val_batch_size"] == 1
 
 
 def test_checkpoint_and_training_state_roundtrip(tmp_path):
@@ -288,6 +400,23 @@ def test_checkpoint_and_training_state_roundtrip(tmp_path):
     restored.load_network(restored.net_g, str(model_checkpoint), strict=True)
     training_state = torch.load(training_state_path, weights_only=False)
     restored.resume_training(training_state)
+
+
+def test_best_checkpoint_contains_evaluated_ema_weights(tmp_path):
+    options = _training_options(
+        {"type": "Adam", "lr": 2e-4, "betas": (0.9, 0.999)}
+    )
+    options["train"]["ema_decay"] = 0.9
+    options["path"]["experiments_root"] = str(tmp_path)
+    model = CAMEModel(options)
+    model.save_best({"psnr": 25.0, "iter": 10})
+
+    checkpoint = torch.load(
+        tmp_path / "best_psnr_25.00_10.pth",
+        weights_only=False,
+    )
+    assert set(checkpoint) == {"params", "params_ema"}
+    assert checkpoint["params_ema"].keys() == checkpoint["params"].keys()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
