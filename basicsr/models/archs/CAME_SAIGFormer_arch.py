@@ -20,6 +20,7 @@ from basicsr.models.archs.came_modules import (
     ManifoldAdaptiveIllumination,
     ObservabilityEstimator,
     ObservabilitySelectiveSkipFusion,
+    ReliabilityCalibratedSkipFusion,
     OverlapPatchEmbed,
     Upsample,
 )
@@ -45,6 +46,9 @@ class CAME_SAIGFormer(nn.Module):
         use_observability: bool = True,
         use_counterfactual: bool = True,
         use_selective_skip_fusion: bool = False,
+        use_reliability_calibrated_skip_fusion: bool = False,
+        reliability_fusion_levels: Tuple[int, ...] = (1, 2),
+        reliability_gate_groups: int = 8,
     ):
         super().__init__()
         if not (
@@ -60,6 +64,23 @@ class CAME_SAIGFormer(nn.Module):
         self.use_observability = use_observability
         self.use_counterfactual = use_counterfactual
         self.use_selective_skip_fusion = use_selective_skip_fusion
+        self.use_reliability_calibrated_skip_fusion = (
+            use_reliability_calibrated_skip_fusion
+        )
+        if (
+            use_selective_skip_fusion
+            and use_reliability_calibrated_skip_fusion
+        ):
+            raise ValueError(
+                "Legacy selective skip fusion and reliability-calibrated "
+                "skip fusion cannot be enabled together."
+            )
+        reliability_fusion_levels = tuple(reliability_fusion_levels)
+        if not set(reliability_fusion_levels).issubset({1, 2, 3}):
+            raise ValueError(
+                "reliability_fusion_levels must be selected from (1, 2, 3)."
+            )
+        self.reliability_fusion_levels = reliability_fusion_levels
         inp_channels = 3
         out_channels = 3
         bias = False
@@ -168,10 +189,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up4_3 = Upsample(embed_dim * 8)
-        self.skip_fusion_level3 = (
-            ObservabilitySelectiveSkipFusion(embed_dim * 4, bias=bias)
-            if use_selective_skip_fusion
-            else None
+        self.skip_fusion_level3 = self._make_skip_fusion(
+            level=3,
+            dim=embed_dim * 4,
+            reliability_gate_groups=reliability_gate_groups,
+            bias=bias,
         )
         self.reduce_chan_level3 = nn.Conv2d(
             embed_dim * 8, embed_dim * 4, 1, bias=bias
@@ -185,10 +207,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up3_2 = Upsample(embed_dim * 4)
-        self.skip_fusion_level2 = (
-            ObservabilitySelectiveSkipFusion(embed_dim * 2, bias=bias)
-            if use_selective_skip_fusion
-            else None
+        self.skip_fusion_level2 = self._make_skip_fusion(
+            level=2,
+            dim=embed_dim * 2,
+            reliability_gate_groups=reliability_gate_groups,
+            bias=bias,
         )
         self.reduce_chan_level2 = nn.Conv2d(
             embed_dim * 4, embed_dim * 2, 1, bias=bias
@@ -202,10 +225,11 @@ class CAME_SAIGFormer(nn.Module):
             ]
         )
         self.up2_1 = Upsample(embed_dim * 2)
-        self.skip_fusion_level1 = (
-            ObservabilitySelectiveSkipFusion(embed_dim, bias=bias)
-            if use_selective_skip_fusion
-            else None
+        self.skip_fusion_level1 = self._make_skip_fusion(
+            level=1,
+            dim=embed_dim,
+            reliability_gate_groups=reliability_gate_groups,
+            bias=bias,
         )
         self.decoder_level1 = nn.ModuleList(
             [
@@ -226,6 +250,29 @@ class CAME_SAIGFormer(nn.Module):
         self.output = nn.Conv2d(
             embed_dim * 2, out_channels, k_s, 1, k_s // 2, bias=bias
         )
+
+    def _make_skip_fusion(
+        self,
+        level: int,
+        dim: int,
+        reliability_gate_groups: int,
+        bias: bool,
+    ) -> Optional[nn.Module]:
+        if self.use_selective_skip_fusion:
+            return ObservabilitySelectiveSkipFusion(dim, bias=bias)
+        if (
+            self.use_reliability_calibrated_skip_fusion
+            and level in self.reliability_fusion_levels
+        ):
+            gate_groups = min(reliability_gate_groups, dim)
+            while dim % gate_groups != 0:
+                gate_groups -= 1
+            return ReliabilityCalibratedSkipFusion(
+                dim,
+                gate_groups=gate_groups,
+                bias=bias,
+            )
+        return None
 
     def _prepare_manifold(
         self, inp_img: torch.Tensor

@@ -6,8 +6,15 @@ import torch.nn.functional as F
 
 from basicsr.models.came_model import CAMEModel
 from basicsr.models.archs.CAME_SAIGFormer_arch import CAME_SAIGFormer
-from basicsr.models.archs.came_modules import CAMT
-from basicsr.models.losses.came_losses import CAMELoss
+from basicsr.models.archs.came_modules import (
+    CAMT,
+    ReliabilityCalibratedSkipFusion,
+)
+from basicsr.models.losses.came_losses import (
+    CAMELoss,
+    ObservabilityCalibrationLoss,
+)
+from basicsr.utils.checkpoint import select_network_state
 from basicsr.utils.options import parse
 
 
@@ -134,6 +141,7 @@ def test_full_network_forward_loss_backward_and_inference():
         "l_cycle",
         "l_raed",
         "l_obs_smooth",
+        "l_obs_calibration",
         "l_disentangle",
         "l_intervention_diversity",
         "l_came_total",
@@ -195,6 +203,71 @@ def test_selective_skip_fusion_preserves_pretrained_initial_function():
     ]
     assert all(gradient is not None for gradient in correction_gradients)
     assert all(torch.isfinite(gradient).all() for gradient in correction_gradients)
+
+
+def test_reliability_calibrated_skip_fusion_is_bounded_and_trainable():
+    torch.manual_seed(4)
+    fusion = ReliabilityCalibratedSkipFusion(dim=8, gate_groups=4)
+    skip = torch.rand(1, 8, 16, 16)
+    decoder = torch.rand_like(skip)
+    illumination = torch.rand(1, 3, 16, 16)
+
+    fully_reliable = torch.ones(1, 1, 16, 16)
+    reliable_output = fusion(skip, decoder, illumination, fully_reliable)
+    torch.testing.assert_close(reliable_output, skip)
+
+    unreliable = torch.zeros_like(fully_reliable)
+    output = fusion(skip, decoder, illumination, unreliable)
+    assert output.shape == skip.shape
+    assert 0 < fusion.blend_strength.item() < 0.01
+    assert torch.isfinite(output).all()
+    output.mean().backward()
+    assert fusion.blend_logit.grad is not None
+    assert fusion.context_correction.weight.grad is not None
+    assert torch.isfinite(fusion.blend_logit.grad)
+    assert torch.isfinite(fusion.context_correction.weight.grad).all()
+
+
+def test_observability_calibration_tracks_paired_difficulty():
+    calibration = ObservabilityCalibrationLoss(
+        loss_weight=1.0,
+        temperature=0.15,
+    )
+    reference = torch.rand(1, 3, 16, 16)
+    perfect_target = calibration.reliability_target(reference, reference)
+    torch.testing.assert_close(perfect_target, torch.ones_like(perfect_target))
+
+    dark_input = torch.zeros_like(reference)
+    bright_target = torch.ones_like(reference)
+    difficult_target = calibration.reliability_target(dark_input, bright_target)
+    assert difficult_target.mean() < perfect_target.mean()
+
+    observability = torch.ones_like(difficult_target, requires_grad=True)
+    loss = calibration(observability, dark_input, bright_target)
+    assert loss.item() > 0
+    loss.backward()
+    assert observability.grad is not None
+    assert torch.isfinite(observability.grad).all()
+
+
+def test_reliability_calibrated_network_uses_shallow_fusions_only():
+    model = _small_network(
+        use_reliability_calibrated_skip_fusion=True,
+        reliability_fusion_levels=(1, 2),
+    )
+    assert isinstance(
+        model.skip_fusion_level1,
+        ReliabilityCalibratedSkipFusion,
+    )
+    assert isinstance(
+        model.skip_fusion_level2,
+        ReliabilityCalibratedSkipFusion,
+    )
+    assert model.skip_fusion_level3 is None
+    model.train()
+    output = model(torch.rand(1, 3, 32, 32))["output"]
+    output.mean().backward()
+    assert model.skip_fusion_level1.blend_logit.grad is not None
 
 
 @pytest.mark.parametrize(
@@ -261,6 +334,7 @@ def test_training_model_optimizer_scheduler_and_config_integrity(
         "l_cycle",
         "l_raed",
         "l_obs_smooth",
+        "l_obs_calibration",
         "l_disentangle",
         "l_intervention_diversity",
         "l_came_total",
@@ -386,6 +460,92 @@ def test_ocsf_scratch_config_has_full_training_schedule():
     assert options["datasets"]["val"]["dataroot_lq"].endswith(
         "datasets/LOLv1/Test/input"
     )
+
+
+@pytest.mark.parametrize(
+    ("config_path", "uses_fusion", "uses_calibration"),
+    [
+        (
+            "Options/CAME_SAIGFormer_lolv1_rcsf_ablation_baseline.yml",
+            False,
+            False,
+        ),
+        (
+            "Options/CAME_SAIGFormer_lolv1_rcsf_ablation_fusion_only.yml",
+            True,
+            False,
+        ),
+        ("Options/CAME_SAIGFormer_lolv1_rcsf.yml", True, True),
+    ],
+)
+def test_rcsf_configs_form_a_controlled_ablation(
+    config_path,
+    uses_fusion,
+    uses_calibration,
+):
+    options = parse(config_path, is_train=True)
+    train_data = options["datasets"]["train"]
+    scheduler = options["train"]["scheduler"]
+    assert options["network_g"][
+        "use_reliability_calibrated_skip_fusion"
+    ] is uses_fusion
+    assert options["train"]["came_loss_opt"][
+        "use_observability_calibration"
+    ] is uses_calibration
+    assert options["network_g"]["reliability_fusion_levels"] == [1, 2]
+    assert options["network_g"]["train_patch"] == 128
+    assert train_data["gt_sizes"] == [128, 192, 256]
+    assert train_data["mini_batch_sizes"] == [8, 4, 2]
+    assert sum(train_data["iters"]) == options["train"]["total_iter"]
+    assert sum(scheduler["periods"]) == options["train"]["total_iter"]
+    assert scheduler["restart_weights"] == [1]
+
+
+def test_rcsf_parameter_overhead_is_below_point_two_percent():
+    baseline = CAME_SAIGFormer()
+    enhanced = CAME_SAIGFormer(
+        use_reliability_calibrated_skip_fusion=True,
+    )
+    baseline_parameters = sum(
+        parameter.numel() for parameter in baseline.parameters()
+    )
+    enhanced_parameters = sum(
+        parameter.numel() for parameter in enhanced.parameters()
+    )
+    overhead = (enhanced_parameters - baseline_parameters) / baseline_parameters
+    assert overhead < 0.002
+
+
+def test_rcsf_psnr_finetune_is_explicit_and_checkpoint_driven():
+    options = parse(
+        "Options/CAME_SAIGFormer_lolv1_rcsf_psnr_finetune.yml",
+        is_train=True,
+    )
+    assert options["train"]["total_iter"] == 20000
+    assert options["train"]["optim_g"]["lr"] == pytest.approx(1e-5)
+    assert options["path"]["param_key"] == "params_ema"
+    assert "REPLACE_WITH_YOUR_BEST" in options["path"][
+        "pretrain_network_g"
+    ]
+    psnr_losses = [
+        loss
+        for loss in options["train"]["pixel_opt"]
+        if loss["type"] == "PSNRLoss"
+    ]
+    assert len(psnr_losses) == 1
+    assert psnr_losses[0]["loss_weight"] == pytest.approx(0.002)
+    assert options["train"]["came_loss_opt"]["min_auxiliary_scale"] == 0
+
+
+def test_checkpoint_selection_prefers_ema_and_strips_module_prefix():
+    checkpoint = {
+        "params": {"layer.weight": torch.zeros(1)},
+        "params_ema": {"module.layer.weight": torch.ones(1)},
+    }
+    state_dict, selected_key = select_network_state(checkpoint, "auto")
+    assert selected_key == "params_ema"
+    assert set(state_dict) == {"layer.weight"}
+    torch.testing.assert_close(state_dict["layer.weight"], torch.ones(1))
 
 
 def test_checkpoint_and_training_state_roundtrip(tmp_path):

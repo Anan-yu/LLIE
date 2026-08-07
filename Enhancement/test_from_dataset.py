@@ -15,6 +15,7 @@ from glob import glob
 from skimage import img_as_ubyte
 
 from basicsr.models import create_model
+from basicsr.utils import select_network_state
 from basicsr.utils.options import parse
 
 def self_ensemble(x, model):
@@ -59,6 +60,12 @@ parser.add_argument('--dataset', default='LOL_v1', type=str,
 parser.add_argument('--gpus', type=str, default="0", help='GPU devices.')
 parser.add_argument('--GT_mean', action='store_true', help='Use the mean of GT to rectify the output of the model')
 parser.add_argument('--self_ensemble', action='store_true', help='Use self-ensemble to obtain better results')
+parser.add_argument(
+    '--param_key',
+    default='auto',
+    choices=['auto', 'params', 'params_ema'],
+    help='Checkpoint weights to evaluate. auto prefers params_ema when present.',
+)
 
 args = parser.parse_args()
 
@@ -89,17 +96,15 @@ s = x['network_g'].pop('type')
 
 model_restoration = create_model(opt).net_g
 
-checkpoint = torch.load(weights)
-
-try:
-    model_restoration.load_state_dict(checkpoint['params'])
-except:
-    new_checkpoint = {}
-    for k in checkpoint['params']:
-        new_checkpoint['module.' + k] = checkpoint['params'][k]
-    model_restoration.load_state_dict(new_checkpoint)
+checkpoint = torch.load(weights, map_location='cpu', weights_only=True)
+state_dict, selected_param_key = select_network_state(
+    checkpoint,
+    args.param_key,
+)
+model_restoration.load_state_dict(state_dict, strict=True)
 
 print("===>Testing using weights: ", weights)
+print("===>Checkpoint parameter key: ", selected_param_key)
 model_restoration.cuda()
 model_restoration = nn.DataParallel(model_restoration)
 model_restoration.eval()

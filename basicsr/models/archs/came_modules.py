@@ -512,6 +512,137 @@ class ObservabilitySelectiveSkipFusion(nn.Module):
         return skip + correction
 
 
+class ReliabilityCalibratedSkipFusion(nn.Module):
+    """Convexly replace unreliable skip content with decoder context.
+
+    Unlike an unconstrained additive correction, this module predicts a
+    bounded blend between the encoder skip and a decoder-conditioned
+    candidate.  The blend is spatially modulated by calibrated reliability,
+    so high-reliability detail is preserved while uncertain regions can draw
+    more strongly on the denoised decoder representation.
+
+    The global blend starts close to zero and the decoder projection starts as
+    an identity mapping.  This keeps checkpoint fine-tuning stable while still
+    providing non-zero gradients to every branch from the first update.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        illumination_channels: int = 3,
+        gate_groups: int = 8,
+        initial_blend_logit: float = -5.0,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if gate_groups < 1 or dim % gate_groups != 0:
+            raise ValueError(
+                "gate_groups must be a positive divisor of dim, got "
+                f"dim={dim}, gate_groups={gate_groups}."
+            )
+        hidden_dim = max(dim // 2, 8)
+        input_dim = dim * 2 + illumination_channels + 1
+        self.dim = dim
+        self.gate_groups = gate_groups
+        self.channels_per_gate = dim // gate_groups
+        self.context = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, 1, bias=bias),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                3,
+                padding=1,
+                groups=hidden_dim,
+                bias=bias,
+            ),
+            nn.GELU(),
+        )
+        self.group_gate = nn.Sequential(
+            nn.Conv2d(hidden_dim, gate_groups, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.decoder_candidate = nn.Sequential(
+            nn.Conv2d(
+                dim,
+                dim,
+                3,
+                padding=1,
+                groups=dim,
+                bias=False,
+            ),
+            nn.Conv2d(dim, dim, 1, bias=bias),
+        )
+        self.context_correction = nn.Conv2d(hidden_dim, dim, 1, bias=True)
+        self.blend_logit = nn.Parameter(torch.tensor(float(initial_blend_logit)))
+        self._initialize_stable_candidate()
+
+    def _initialize_stable_candidate(self) -> None:
+        depthwise = self.decoder_candidate[0]
+        pointwise = self.decoder_candidate[1]
+        nn.init.zeros_(depthwise.weight)
+        center = depthwise.kernel_size[0] // 2
+        with torch.no_grad():
+            depthwise.weight[:, 0, center, center] = 1.0
+        nn.init.zeros_(pointwise.weight)
+        with torch.no_grad():
+            diagonal = torch.arange(self.dim)
+            pointwise.weight[diagonal, diagonal, 0, 0] = 1.0
+        if pointwise.bias is not None:
+            nn.init.zeros_(pointwise.bias)
+        nn.init.zeros_(self.context_correction.weight)
+        nn.init.zeros_(self.context_correction.bias)
+
+    @property
+    def blend_strength(self) -> torch.Tensor:
+        """Return the bounded global replacement strength."""
+        return torch.sigmoid(self.blend_logit)
+
+    def forward(
+        self,
+        skip: torch.Tensor,
+        decoder: torch.Tensor,
+        illumination: torch.Tensor,
+        reliability: torch.Tensor,
+    ) -> torch.Tensor:
+        if skip.shape != decoder.shape:
+            raise ValueError(
+                "Skip and decoder features must have identical shapes, got "
+                f"{tuple(skip.shape)} and {tuple(decoder.shape)}."
+            )
+        spatial_size = skip.shape[-2:]
+        if illumination.shape[-2:] != spatial_size:
+            illumination = F.interpolate(
+                illumination,
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        if reliability.shape[-2:] != spatial_size:
+            reliability = F.interpolate(
+                reliability,
+                size=spatial_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        reliability = reliability.clamp(0, 1)
+        context = self.context(
+            torch.cat([skip, decoder, illumination, reliability], dim=1)
+        )
+        group_gate = self.group_gate(context).repeat_interleave(
+            self.channels_per_gate,
+            dim=1,
+        )
+        candidate = self.decoder_candidate(decoder)
+        candidate = candidate + self.context_correction(context)
+        blend = (
+            self.blend_strength
+            * (1.0 - reliability)
+            * group_gate
+        )
+        return skip + blend * (candidate - skip)
+
+
 class ObservabilityConditionedAttention(nn.Module):
     """Channel-transposed attention with spatial illumination modulation."""
 

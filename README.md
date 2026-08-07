@@ -8,7 +8,7 @@ PSNR/SSIM values or state-of-the-art claims are made for the extension.
 ## CAME-SAIGFormer
 
 CAME-SAIGFormer preserves the SAIGFormer encoder-decoder structure and studies
-four complementary components:
+five complementary components:
 
 - **Camera-Adaptive Manifold Transform (CAMT):** maps RGB into an invertible
   luminance/chroma representation. A camera/degradation descriptor conditions a
@@ -23,12 +23,17 @@ four complementary components:
   degradation subspace and constrains re-encoded content to remain stable. This
   is a latent degradation intervention, not an explicit simulation of the
   physical camera exposure process.
+- **Reliability-Calibrated Selective Fusion (RCSF):** calibrates the
+  observability map against paired restoration difficulty and uses a bounded,
+  group-wise convex blend to replace unreliable shallow skip content with
+  decoder-conditioned features. The default Level-1/2 modules add 14,786
+  parameters (about 0.107% over CAME-SAIGFormer).
 
 The auxiliary objectives include CAMT cycle consistency, content invariance,
 content/degradation disentanglement, intervention-direction diversity,
-observability smoothness, and reference-ambiguity-aware exposure distribution
-(RAED). Standard L1/SSIM reconstruction remains configured separately through
-`pixel_opt`.
+observability smoothness, paired observability calibration, and
+reference-ambiguity-aware exposure distribution (RAED). Standard L1/SSIM
+reconstruction remains configured separately through `pixel_opt`.
 
 ## Ablations
 
@@ -40,6 +45,8 @@ use_manifold_illumination: true
 use_observability: true
 use_counterfactual: true
 use_selective_skip_fusion: false
+use_reliability_calibrated_skip_fusion: false
+reliability_fusion_levels: [1, 2]
 ```
 
 Auxiliary loss switches are under `train.came_loss_opt`:
@@ -49,10 +56,13 @@ use_raed: true
 use_cycle: true
 use_disentangle: true
 use_intervention_diversity: true
+use_observability_calibration: false
 ```
 
-All switches default to `true`. Disable one switch at a time and keep the data
-split, seed, schedule, checkpoint policy, and metric implementation fixed for a
+The original CAME component switches default to `true`; the new RCSF and
+observability-calibration switches are opt-in and default to `false` for legacy
+checkpoint compatibility. Disable one switch at a time and keep the data split,
+seed, schedule, checkpoint policy, and metric implementation fixed for a
 controlled ablation.
 
 ## Environment Setup
@@ -90,6 +100,39 @@ python basicsr/train.py --opt Options/CAME_SAIGFormer_lolv1.yml
 The committed 200K-iteration schedule is an experiment configuration, not
 evidence of convergence. Monitor validation metrics and visual failure cases,
 and compare against the baseline using identical settings.
+
+### LOL-v1 RCSF controlled training
+
+The paper-oriented RCSF experiment uses progressive `128 -> 192 -> 256`
+patches, a single 120K cosine cycle, EMA validation, and the same L1 + SSIM
+reconstruction objective across all architecture ablations. Start the full
+method with:
+
+```bash
+python basicsr/train.py --opt Options/CAME_SAIGFormer_lolv1_rcsf.yml
+```
+
+The committed controlled ablations are:
+
+| Configuration | RCSF | Reliability calibration |
+| --- | --- | --- |
+| `CAME_SAIGFormer_lolv1_rcsf_ablation_baseline.yml` | off | off |
+| `CAME_SAIGFormer_lolv1_rcsf_ablation_fusion_only.yml` | on | off |
+| `CAME_SAIGFormer_lolv1_rcsf.yml` | on | on |
+
+Do not mix the legacy OCSF loss recipe into this comparison. After stage 1,
+replace `REPLACE_WITH_YOUR_BEST` in
+`CAME_SAIGFormer_lolv1_rcsf_psnr_finetune.yml` with the best stage-1 checkpoint
+filename and run the isolated 20K RGB-PSNR refinement:
+
+```bash
+python basicsr/train.py \
+  --opt Options/CAME_SAIGFormer_lolv1_rcsf_psnr_finetune.yml
+```
+
+The stage-2 configuration loads `params_ema`, uses a low `1e-5` learning rate,
+and decays research auxiliary objectives to zero. Its PSNR loss is intentionally
+excluded from the stage-1 architecture ablation.
 
 ### LOL-v1 OCSF stage-2 fine-tuning
 
@@ -137,10 +180,15 @@ Use a CAME-SAIGFormer checkpoint with the matching CAME configuration:
 
 ```bash
 python Enhancement/test_from_dataset.py \
-  --opt Options/CAME_SAIGFormer_lolv1.yml \
+  --opt Options/CAME_SAIGFormer_lolv1_rcsf.yml \
   --weights /path/to/came_checkpoint.pth \
-  --dataset LOL_v1
+  --dataset LOL_v1 \
+  --param_key auto
 ```
+
+`--param_key auto` prefers `params_ema` when it is available, matching the
+network used for validation and best-checkpoint selection. Use
+`--param_key params` only for an explicit raw-versus-EMA ablation.
 
 The test script requires CUDA in its current form. It does **not** apply
 ground-truth mean correction by default. The legacy `--GT_mean` flag remains an

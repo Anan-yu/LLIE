@@ -1,0 +1,141 @@
+# Stage-2 RGB-PSNR fine-tuning for a trained LOL-v1 RCSF checkpoint.
+# Replace the checkpoint filename below with the best stage-1 EMA checkpoint.
+name: CAME_SAIGFormer_lolv1_rcsf_psnr_finetune
+model_type: CAMEModel
+use_amp: false
+amp_init_scale: 1024.0
+scale: 1
+num_gpu: 1
+manual_seed: 100
+
+datasets:
+  train:
+    name: TrainSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./datasets/LOLv1/Train/target
+    dataroot_lq: ./datasets/LOLv1/Train/input
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+    use_shuffle: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 4
+    mini_batch_sizes: [4, 2]
+    iters: [10000, 10000]
+    gt_size: 256
+    gt_sizes: [192, 256]
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val:
+    name: ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./datasets/LOLv1/Test/target
+    dataroot_lq: ./datasets/LOLv1/Test/input
+    io_backend:
+      type: disk
+    val_batch_size: 1
+    val_num_worker: 4
+
+network_g:
+  type: CAME_SAIGFormer
+  embed_dim: 32
+  train_patch: 128
+  eps: !!float 1e-1
+  descriptor_dim: 64
+  num_interventions: 2
+  use_camt: true
+  use_manifold_illumination: true
+  use_observability: true
+  use_counterfactual: true
+  use_selective_skip_fusion: false
+  use_reliability_calibrated_skip_fusion: true
+  reliability_fusion_levels: [1, 2]
+  reliability_gate_groups: 8
+
+path:
+  root: ./outputs
+  pretrain_network_g: ./outputs/experiments/CAME_SAIGFormer_lolv1_rcsf/best_psnr_REPLACE_WITH_YOUR_BEST.pth
+  strict_load_g: true
+  param_key: params_ema
+  resume_state: ~
+
+train:
+  total_iter: 20000
+  warmup_iter: 500
+  grad_clip_norm: 1.0
+  ema_decay: 0.9995
+
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [20000]
+    restart_weights: [1]
+    eta_mins: [0.0000001]
+
+  mixing_augs:
+    mixup: false
+    mixup_beta: 1.2
+    use_identity: true
+
+  optim_g:
+    type: Adam
+    lr: !!float 1e-5
+    betas: [0.9, 0.999]
+
+  # PSNR-oriented refinement is isolated from the architecture ablation.
+  pixel_opt:
+    - type: L1Loss
+      loss_weight: 1
+      reduction: mean
+    - type: SSIMLoss
+      loss_weight: 0.2
+    - type: PSNRLoss
+      loss_weight: 0.002
+      reduction: mean
+      toY: false
+
+  came_loss_opt:
+    content_inv_weight: 0.05
+    cycle_weight: 0.02
+    raed_weight: 0.03
+    obs_smooth_weight: 0.01
+    obs_calibration_weight: 0.02
+    obs_calibration_temperature: 0.15
+    disentangle_weight: 0.01
+    intervention_diversity_weight: 0.005
+    use_raed: true
+    use_cycle: true
+    use_disentangle: true
+    use_intervention_diversity: true
+    use_observability_calibration: true
+    warmup_iter: 0
+    decay_start_iter: 0
+    decay_end_iter: 5000
+    min_auxiliary_scale: 0.0
+
+val:
+  window_size: 4
+  val_freq: !!float 2.5e2
+  save_img: false
+  rgb2bgr: true
+  use_image: false
+  max_minibatch: 1
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: !!float 1e3
+  use_tb_logger: true
+  logger_path: ./tb_logger
+  wandb:
+    project: low_light
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

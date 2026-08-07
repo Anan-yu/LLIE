@@ -160,6 +160,97 @@ class RAEDLoss(nn.Module):
         return self.loss_weight * (quantile_loss + 0.3 * ordering_loss)
 
 
+class ObservabilityCalibrationLoss(nn.Module):
+    """Calibrate recoverability against paired restoration difficulty.
+
+    The target combines local photometric error and gradient degradation.
+    Regions that differ strongly from the paired reference receive lower
+    reliability, while already faithful regions remain close to one.  The
+    target is detached: it supervises observability without creating a shortcut
+    through the input or reference tensors.
+    """
+
+    def __init__(
+        self,
+        loss_weight: float = 0.01,
+        temperature: float = 0.15,
+        kernel_size: int = 5,
+        gradient_weight: float = 0.5,
+        minimum_reliability: float = 0.05,
+    ):
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer.")
+        if not 0 <= minimum_reliability < 1:
+            raise ValueError("minimum_reliability must be in [0, 1).")
+        self.loss_weight = float(loss_weight)
+        self.temperature = float(temperature)
+        self.kernel_size = int(kernel_size)
+        self.gradient_weight = float(gradient_weight)
+        self.minimum_reliability = float(minimum_reliability)
+
+    @staticmethod
+    def _gradient_magnitude(image: torch.Tensor) -> torch.Tensor:
+        gradient_h = F.pad(
+            image[:, :, 1:, :] - image[:, :, :-1, :],
+            (0, 0, 0, 1),
+            mode="replicate",
+        )
+        gradient_w = F.pad(
+            image[:, :, :, 1:] - image[:, :, :, :-1],
+            (0, 1, 0, 0),
+            mode="replicate",
+        )
+        return torch.sqrt(
+            gradient_h.square() + gradient_w.square() + 1e-8
+        ).mean(dim=1, keepdim=True)
+
+    def reliability_target(
+        self,
+        input_image: torch.Tensor,
+        ground_truth: torch.Tensor,
+    ) -> torch.Tensor:
+        photometric_error = (input_image - ground_truth).abs().mean(
+            dim=1,
+            keepdim=True,
+        )
+        input_gradient = self._gradient_magnitude(input_image)
+        target_gradient = self._gradient_magnitude(ground_truth)
+        gradient_error = (input_gradient - target_gradient).abs()
+        difficulty = photometric_error + self.gradient_weight * gradient_error
+        padding = self.kernel_size // 2
+        difficulty = F.pad(
+            difficulty,
+            (padding, padding, padding, padding),
+            mode="replicate",
+        )
+        difficulty = F.avg_pool2d(
+            difficulty,
+            kernel_size=self.kernel_size,
+            stride=1,
+        )
+        reliability = torch.exp(-difficulty / self.temperature)
+        return reliability.clamp(self.minimum_reliability, 1.0).detach()
+
+    def forward(
+        self,
+        observability: torch.Tensor,
+        input_image: torch.Tensor,
+        ground_truth: torch.Tensor,
+    ) -> torch.Tensor:
+        target = self.reliability_target(input_image, ground_truth)
+        if observability.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(
+                target,
+                size=observability.shape[-2:],
+                mode="area",
+            )
+        loss = F.smooth_l1_loss(observability, target)
+        return self.loss_weight * loss
+
+
 class ObservabilitySmoothLoss(nn.Module):
     def __init__(self, loss_weight: float = 0.01):
         super().__init__()
@@ -196,20 +287,28 @@ class CAMELoss(nn.Module):
         obs_smooth_weight: float = 0.01,
         disentangle_weight: float = 0.01,
         intervention_diversity_weight: float = 0.005,
+        obs_calibration_weight: float = 0.0,
+        obs_calibration_temperature: float = 0.15,
         use_raed: bool = True,
         use_cycle: bool = True,
         use_disentangle: bool = True,
         use_intervention_diversity: bool = True,
+        use_observability_calibration: bool = False,
     ):
         super().__init__()
         self.use_raed = use_raed
         self.use_cycle = use_cycle
         self.use_disentangle = use_disentangle
         self.use_intervention_diversity = use_intervention_diversity
+        self.use_observability_calibration = use_observability_calibration
         self.content_inv_loss = ContentInvarianceLoss(content_inv_weight)
         self.cycle_loss = CycleConsistencyLoss(cycle_weight)
         self.raed_loss = RAEDLoss(raed_weight)
         self.obs_smooth_loss = ObservabilitySmoothLoss(obs_smooth_weight)
+        self.obs_calibration_loss = ObservabilityCalibrationLoss(
+            loss_weight=obs_calibration_weight,
+            temperature=obs_calibration_temperature,
+        )
         self.disentangle_loss = DisentangleLoss(disentangle_weight)
         self.intervention_diversity_loss = InterventionDiversityLoss(
             intervention_diversity_weight
@@ -245,6 +344,16 @@ class CAMELoss(nn.Module):
             if observability is not None
             else zero
         )
+        observability_calibration = (
+            self.obs_calibration_loss(
+                observability,
+                input_image,
+                ground_truth,
+            )
+            if self.use_observability_calibration
+            and observability is not None
+            else zero
+        )
         degradation: Optional[torch.Tensor] = model_output.get(
             "degradation_features"
         )
@@ -269,6 +378,7 @@ class CAMELoss(nn.Module):
             "l_cycle": cycle,
             "l_raed": raed,
             "l_obs_smooth": observability_smoothness,
+            "l_obs_calibration": observability_calibration,
             "l_disentangle": disentangle,
             "l_intervention_diversity": diversity,
         }

@@ -117,11 +117,17 @@ class CAMEModel(BaseModel):
             disentangle_weight=came_loss_opt.get('disentangle_weight', 0.01),
             intervention_diversity_weight=came_loss_opt.get(
                 'intervention_diversity_weight', 0.005),
+            obs_calibration_weight=came_loss_opt.get(
+                'obs_calibration_weight', 0.0),
+            obs_calibration_temperature=came_loss_opt.get(
+                'obs_calibration_temperature', 0.15),
             use_raed=came_loss_opt.get('use_raed', True),
             use_cycle=came_loss_opt.get('use_cycle', True),
             use_disentangle=came_loss_opt.get('use_disentangle', True),
             use_intervention_diversity=came_loss_opt.get(
                 'use_intervention_diversity', True),
+            use_observability_calibration=came_loss_opt.get(
+                'use_observability_calibration', False),
         ).to(self.device)
         
         # Progressive loss scheduling: warmup CAME losses after N iterations
