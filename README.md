@@ -105,12 +105,18 @@ and compare against the baseline using identical settings.
 
 The paper-oriented RCSF experiment uses progressive `128 -> 192 -> 256`
 patches, a single 120K cosine cycle, EMA validation, and the same L1 + SSIM
-reconstruction objective across all architecture ablations. Start the full
-method with:
+reconstruction objective across all architecture ablations. From the repository
+root, start the full method with the short launcher:
 
 ```bash
-python basicsr/train.py --opt Options/CAME_SAIGFormer_lolv1_rcsf.yml
+python train.py lolv1
 ```
+
+This command validates the four paired LOLv1 directories, selects GPU 0 unless
+`CUDA_VISIBLE_DEVICES` is already set, and uses
+`Options/CAME_SAIGFormer_lolv1_rcsf.yml`. Use `--gpu 1` to select another GPU or
+`--dry-run` to verify the setup without starting training. The original explicit
+`python basicsr/train.py --opt ...` entry point remains available.
 
 The committed controlled ablations are:
 
