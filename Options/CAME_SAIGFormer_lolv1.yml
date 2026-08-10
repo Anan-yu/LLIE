@@ -102,7 +102,7 @@ train:
 
 val:
   window_size: 4
-  val_freq: !!float 0.5e2
+  val_freq: !!float 5e2
   save_img: false
   rgb2bgr: true
   use_image: false
