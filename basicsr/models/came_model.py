@@ -263,8 +263,18 @@ class CAMEModel(BaseModel):
 
     def _clip_gradients(self):
         if self.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.net_g.parameters(), self.grad_clip_norm)
+            # Clip the exact tensors owned by the optimizer.  Enumerating
+            # ``self.net_g.parameters()`` here can trigger a PyTorch 2.6
+            # named-module recursion failure after long-running training.
+            parameters = [
+                parameter
+                for group in self.optimizer_g.param_groups
+                for parameter in group['params']
+                if parameter.grad is not None
+            ]
+            if parameters:
+                torch.nn.utils.clip_grad_norm_(
+                    parameters, self.grad_clip_norm)
 
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
