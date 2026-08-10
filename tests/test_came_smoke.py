@@ -494,11 +494,21 @@ def test_rcsf_configs_form_a_controlled_ablation(
     ] is uses_calibration
     assert options["network_g"]["reliability_fusion_levels"] == [1, 2]
     assert options["network_g"]["train_patch"] == 128
-    assert train_data["gt_sizes"] == [128, 192, 256]
-    assert train_data["mini_batch_sizes"] == [8, 4, 2]
+    assert train_data["gt_sizes"] == [128]
+    assert train_data["mini_batch_sizes"] == [8]
+    assert train_data["iters"] == [200000]
+    assert train_data["gt_size"] == 128
     assert sum(train_data["iters"]) == options["train"]["total_iter"]
     assert sum(scheduler["periods"]) == options["train"]["total_iter"]
-    assert scheduler["restart_weights"] == [1]
+    assert scheduler["periods"] == [60000, 140000]
+    assert scheduler["restart_weights"] == [1, 1]
+    assert scheduler["eta_mins"] == [0.000001, 0.0000001]
+    assert options["train"]["ema_decay"] == 0
+    assert options["datasets"]["val"]["val_batch_size"] == 4
+    assert options["datasets"]["val"]["val_num_worker"] == 8
+    assert options["val"]["max_minibatch"] == 8
+    assert "decay_start_iter" not in options["train"]["came_loss_opt"]
+    assert "decay_end_iter" not in options["train"]["came_loss_opt"]
 
 
 def test_rcsf_parameter_overhead_is_below_point_two_percent():
@@ -523,7 +533,7 @@ def test_rcsf_psnr_finetune_is_explicit_and_checkpoint_driven():
     )
     assert options["train"]["total_iter"] == 20000
     assert options["train"]["optim_g"]["lr"] == pytest.approx(1e-5)
-    assert options["path"]["param_key"] == "params_ema"
+    assert options["path"]["param_key"] == "params"
     assert "REPLACE_WITH_YOUR_BEST" in options["path"][
         "pretrain_network_g"
     ]

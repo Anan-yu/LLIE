@@ -1,5 +1,5 @@
 # LOL-v1 Reliability-Calibrated Selective Fusion (RCSF), trained from scratch.
-name: CAME_SAIGFormer_lolv1_rcsf_ablation_fusion_only
+name: CAME_SAIGFormer_lolv1_rcsf_ablation_fusion_only_2471_protocol
 model_type: CAMEModel
 use_amp: false
 amp_init_scale: 1024.0
@@ -20,10 +20,10 @@ datasets:
     use_shuffle: true
     num_worker_per_gpu: 8
     batch_size_per_gpu: 8
-    mini_batch_sizes: [8, 4, 2]
-    iters: [40000, 40000, 40000]
-    gt_size: 256
-    gt_sizes: [128, 192, 256]
+    mini_batch_sizes: [8]
+    iters: [200000]
+    gt_size: 128
+    gt_sizes: [128]
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
@@ -34,8 +34,8 @@ datasets:
     dataroot_lq: ./datasets/LOLv1/Test/input
     io_backend:
       type: disk
-    val_batch_size: 1
-    val_num_worker: 4
+    val_batch_size: 4
+    val_num_worker: 8
 
 network_g:
   type: CAME_SAIGFormer
@@ -61,16 +61,16 @@ path:
   resume_state: ~
 
 train:
-  total_iter: 120000
+  total_iter: 200000
   warmup_iter: 2000
   grad_clip_norm: 1.0
-  ema_decay: 0.999
+  ema_decay: 0
 
   scheduler:
     type: CosineAnnealingRestartCyclicLR
-    periods: [120000]
-    restart_weights: [1]
-    eta_mins: [0.000001]
+    periods: [60000, 140000]
+    restart_weights: [1, 1]
+    eta_mins: [0.000001, 0.0000001]
 
   mixing_augs:
     mixup: false
@@ -105,9 +105,6 @@ train:
     use_intervention_diversity: true
     use_observability_calibration: false
     warmup_iter: 5000
-    decay_start_iter: 80000
-    decay_end_iter: 110000
-    min_auxiliary_scale: 0.0
 
 val:
   window_size: 4
@@ -115,7 +112,7 @@ val:
   save_img: false
   rgb2bgr: true
   use_image: false
-  max_minibatch: 1
+  max_minibatch: 8
   metrics:
     psnr:
       type: calculate_psnr

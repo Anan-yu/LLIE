@@ -1,5 +1,5 @@
 # Stage-2 RGB-PSNR fine-tuning for a trained LOL-v1 RCSF checkpoint.
-# Replace the checkpoint filename below with the best stage-1 EMA checkpoint.
+# Replace the checkpoint filename below with the best stage-1 raw checkpoint.
 name: CAME_SAIGFormer_lolv1_rcsf_psnr_finetune
 model_type: CAMEModel
 use_amp: false
@@ -56,9 +56,9 @@ network_g:
 
 path:
   root: ./outputs
-  pretrain_network_g: ./outputs/experiments/CAME_SAIGFormer_lolv1_rcsf/best_psnr_REPLACE_WITH_YOUR_BEST.pth
+  pretrain_network_g: ./outputs/experiments/CAME_SAIGFormer_lolv1_rcsf_2471_protocol/best_psnr_REPLACE_WITH_YOUR_BEST.pth
   strict_load_g: true
-  param_key: params_ema
+  param_key: params
   resume_state: ~
 
 train:

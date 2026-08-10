@@ -103,10 +103,12 @@ and compare against the baseline using identical settings.
 
 ### LOL-v1 RCSF controlled training
 
-The paper-oriented RCSF experiment uses progressive `128 -> 192 -> 256`
-patches, a single 120K cosine cycle, EMA validation, and the same L1 + SSIM
-reconstruction objective across all architecture ablations. From the repository
-root, start the full method with the short launcher:
+The paper-oriented RCSF experiment now uses the reproduced 24.71 training
+protocol: fixed `128 x 128` patches, batch size 8, 200K iterations, two cosine
+cycles (`60K + 140K`), and raw-network validation without EMA. The RCSF fusion
+and reliability-calibration changes remain enabled; only the training protocol
+is aligned so comparisons isolate the method rather than the schedule. From the
+repository root, start the full method with the short launcher:
 
 ```bash
 python train.py lolv1
@@ -114,7 +116,9 @@ python train.py lolv1
 
 This command validates the four paired LOLv1 directories, selects GPU 0 unless
 `CUDA_VISIBLE_DEVICES` is already set, and uses
-`Options/CAME_SAIGFormer_lolv1_rcsf.yml`. Use `--gpu 1` to select another GPU or
+`Options/CAME_SAIGFormer_lolv1_rcsf.yml`. Its experiment name ends in
+`_2471_protocol`, which deliberately creates a fresh output directory instead of
+resuming the older 120K RCSF run. Use `--gpu 1` to select another GPU or
 `--dry-run` to verify the setup without starting training. The original explicit
 `python basicsr/train.py --opt ...` entry point remains available.
 
@@ -136,8 +140,8 @@ python basicsr/train.py \
   --opt Options/CAME_SAIGFormer_lolv1_rcsf_psnr_finetune.yml
 ```
 
-The stage-2 configuration loads `params_ema`, uses a low `1e-5` learning rate,
-and decays research auxiliary objectives to zero. Its PSNR loss is intentionally
+The stage-2 configuration loads the raw `params` checkpoint, uses a low `1e-5`
+learning rate, and decays research auxiliary objectives to zero. Its PSNR loss is intentionally
 excluded from the stage-1 architecture ablation.
 
 ### LOL-v1 OCSF stage-2 fine-tuning
